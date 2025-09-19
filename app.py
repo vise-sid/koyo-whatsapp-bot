@@ -194,6 +194,39 @@ async def test_whatsapp_message(request: Request):
         logger.error(f"Test WhatsApp endpoint error: {str(e)}")
         return {"error": str(e), "success": False}
 
+@app.get("/whatsapp-status")
+async def whatsapp_status():
+    """Check WhatsApp configuration status"""
+    try:
+        # Check if all required environment variables are set
+        config_status = {
+            "twilio_account_sid": bool(TWILIO_ACCOUNT_SID),
+            "twilio_auth_token": bool(TWILIO_AUTH_TOKEN),
+            "twilio_whatsapp_from": bool(TWILIO_WHATSAPP_FROM),
+            "whatsapp_from_number": TWILIO_WHATSAPP_FROM
+        }
+        
+        # Test Twilio client initialization
+        try:
+            client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+            # Try to get account info to verify credentials
+            account = client.api.accounts(TWILIO_ACCOUNT_SID).fetch()
+            config_status["twilio_connection"] = True
+            config_status["account_friendly_name"] = account.friendly_name
+        except Exception as e:
+            config_status["twilio_connection"] = False
+            config_status["twilio_error"] = str(e)
+        
+        return {
+            "success": True,
+            "config": config_status,
+            "message": "WhatsApp configuration status checked"
+        }
+        
+    except Exception as e:
+        logger.error(f"WhatsApp status check error: {str(e)}")
+        return {"error": str(e), "success": False}
+
 @app.on_event("startup")
 async def startup_event():
     """Start background tasks when the app starts"""
@@ -303,30 +336,6 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         from_number=TWILIO_WHATSAPP_FROM
     )
     
-    # Define the WhatsApp messaging function for OpenAI function calling
-    def send_whatsapp_message(to_number: str, message: str) -> str:
-        """
-        Send a WhatsApp text message to a user during the conversation.
-        
-        Args:
-            to_number: The recipient's phone number (with country code, e.g., +1234567890)
-            message: The message content to send
-            
-        Returns:
-            A status message about the message sending operation
-        """
-        try:
-            # Use asyncio to run the async function
-            loop = asyncio.get_event_loop()
-            result = loop.run_until_complete(whatsapp_service.send_message(to_number, message))
-            
-            if result["success"]:
-                return f"✅ WhatsApp message sent successfully to {to_number}: '{message}'"
-            else:
-                return f"❌ Failed to send WhatsApp message to {to_number}: {result.get('error', 'Unknown error')}"
-        except Exception as e:
-            return f"❌ Error sending WhatsApp message: {str(e)}"
-    
     # Define function schema for OpenAI
     whatsapp_function_schema = {
         "name": "send_whatsapp_message",
@@ -347,11 +356,48 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         }
     }
     
+    # Create a custom function call handler class
+    class WhatsAppFunctionHandler:
+        def __init__(self, whatsapp_service, caller_phone):
+            self.whatsapp_service = whatsapp_service
+            self.caller_phone = caller_phone
+            self.logger = logging.getLogger(__name__)
+        
+        async def handle_function_call(self, function_name: str, arguments: dict) -> str:
+            """Handle function calls from the LLM"""
+            if function_name == "send_whatsapp_message":
+                try:
+                    # Get the phone number, use caller's number if not provided
+                    to_number = arguments.get("to_number", self.caller_phone)
+                    message = arguments.get("message", "")
+                    
+                    if not message:
+                        return "❌ No message content provided"
+                    
+                    # Send the WhatsApp message
+                    result = await self.whatsapp_service.send_message(to_number, message)
+                    
+                    if result["success"]:
+                        self.logger.info(f"WhatsApp message sent successfully: {result}")
+                        return f"✅ WhatsApp message sent successfully to {to_number}"
+                    else:
+                        self.logger.error(f"Failed to send WhatsApp message: {result}")
+                        return f"❌ Failed to send WhatsApp message: {result.get('error', 'Unknown error')}"
+                        
+                except Exception as e:
+                    self.logger.error(f"Error in WhatsApp function handler: {str(e)}")
+                    return f"❌ Error sending WhatsApp message: {str(e)}"
+            else:
+                return f"❌ Unknown function: {function_name}"
+    
+    # Initialize the function handler
+    function_handler = WhatsAppFunctionHandler(whatsapp_service, caller_phone)
+    
     llm = OpenAILLMService(
         api_key=OPENAI_API_KEY, 
         model="gpt-4o",
         functions=[whatsapp_function_schema],
-        function_call_handler=send_whatsapp_message
+        function_call_handler=function_handler.handle_function_call
     )
     tts = ElevenLabsTTSService(
         api_key=ELEVENLABS_API_KEY,
@@ -389,7 +435,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         f"- Text them something important\n"
         f"- Send a follow-up message after the call\n"
         f"- Share contact information, links, or details via text\n\n"
-        f"Use the send_whatsapp_message function to send these messages. If no phone number is specified, use the caller's number ({caller_phone}). Be natural about this capability - mention it casually when relevant, like 'I can text you that info' or 'Let me send you that link on WhatsApp.'\n\n"
+        f"IMPORTANT: When the user requests a WhatsApp message, you MUST use the send_whatsapp_message function. Do NOT just say you're sending it - actually call the function. If no phone number is specified, use the caller's number ({caller_phone}). Be natural about this capability - mention it casually when relevant, like 'I can text you that info' or 'Let me send you that link on WhatsApp.'\n\n"
         f"### CONVERSATIONAL STYLE & VOICE\n\n"
         f"CRITICAL: All Hindi words MUST be written in Devanagari script (e.g., 'क्या') and NOT Romanized (e.g., 'kya'). This is non-negotiable.\n\n"
         f"VOICE-SPECIFIC RULES:\n"
