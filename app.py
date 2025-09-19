@@ -218,21 +218,6 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             encoding="linear16",  # 16-bit linear PCM for better quality
             sample_rate=16000,  # Match our sample rate
             channels=1,  # Mono audio
-            # Noise reduction and enhancement
-            enhance=True,  # Enable audio enhancement
-            punctuate=True,  # Add punctuation for better text quality
-            profanity_filter=False,  # Allow natural speech patterns
-            redact=False,  # Don't redact sensitive info
-            diarize=False,  # No speaker diarization needed
-            multichannel=False,  # Single channel
-            alternatives=1,  # Single alternative for faster processing
-            numerals=True,  # Convert numbers to digits
-            search=[""],  # No keyword search
-            replace=[""],  # No text replacement
-            keywords=[""],  # No keyword boosting
-            # Voice activity detection
-            vad_events=True,  # Enable VAD events
-            endpointing=300,  # Endpoint detection in ms
         )
     )
     llm = OpenAILLMService(api_key=OPENAI_API_KEY, model="gpt-4o")
