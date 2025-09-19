@@ -102,6 +102,8 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             add_wav_header=False,
             vad_analyzer=SileroVADAnalyzer(),
             serializer=serializer,
+            audio_in_format="pcm",
+            audio_out_format="pcm",
         ),
     )
 
@@ -131,13 +133,14 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         pipeline,
         params=PipelineParams(
             audio_in_sample_rate=8000,   # Twilio Media Streams: 8kHz μ-law from WhatsApp/Voice
-            audio_out_sample_rate=8000,
+            audio_out_sample_rate=8000,  # Match input sample rate for Twilio
             allow_interruptions=True,
         ),
     )
 
     @transport.event_handler("on_client_connected")
     async def _greet(_t, _c):
+        logger.info("Client connected, sending greeting...")
         await task.queue_frames([LLMRunFrame()])  # gentle hello
 
     runner = PipelineRunner(handle_sigint=False, force_gc=True)
