@@ -2,6 +2,8 @@ import asyncio
 import os, json, logging
 from typing import Optional
 from urllib.parse import parse_qs
+from datetime import datetime
+import pytz
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, Response
@@ -35,6 +37,41 @@ DEEPGRAM_API_KEY    = os.getenv("DEEPGRAM_API_KEY", "")
 ELEVENLABS_API_KEY  = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "Rachel")
 VALIDATE_TWILIO_SIGNATURE = os.getenv("VALIDATE_TWILIO_SIGNATURE", "false").lower() == "true"
+
+def get_current_time_context():
+    """Get current time and date information for Mumbai timezone"""
+    mumbai_tz = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(mumbai_tz)
+    
+    # Format time and date
+    time_str = now.strftime("%I:%M %p")  # 12-hour format with AM/PM
+    date_str = now.strftime("%A, %B %d, %Y")  # Day, Month Date, Year
+    day_of_week = now.strftime("%A")
+    hour = now.hour
+    
+    # Determine time of day context
+    if 5 <= hour < 12:
+        time_context = "morning"
+    elif 12 <= hour < 17:
+        time_context = "afternoon"
+    elif 17 <= hour < 21:
+        time_context = "evening"
+    else:
+        time_context = "night"
+    
+    return {
+        "time": time_str,
+        "date": date_str,
+        "day_of_week": day_of_week,
+        "time_context": time_context,
+        "hour": hour
+    }
+
+def extract_phone_number(whatsapp_number: str) -> str:
+    """Extract clean phone number from WhatsApp format"""
+    if whatsapp_number and whatsapp_number.startswith("whatsapp:"):
+        return whatsapp_number.replace("whatsapp:", "")
+    return whatsapp_number or "Unknown"
 
 @app.get("/health")
 def health(): return {"ok": True}
@@ -74,12 +111,17 @@ async def voice(request: Request):
         logger.warning("Twilio signature validation failed")
         return Response(status_code=403)
 
-    # Optional: inspect who’s calling; WhatsApp numbers look like "whatsapp:+<E164>"
+    # Extract caller information from webhook
     form = await request.form()
     from_num = form.get("From")
-    to_num   = form.get("To")
-    logger.info(f"Voice webhook From={from_num} To={to_num}")
+    to_num = form.get("To")
+    caller_name = form.get("CallerName", "Unknown")
+    call_sid = form.get("CallSid")
+    
+    logger.info(f"Voice webhook - From: {from_num}, To: {to_num}, Name: {caller_name}, CallSid: {call_sid}")
 
+    # Store caller info for later use in the call
+    # We'll pass this to the WebSocket connection
     twiml = _twiml(_ws_url(request))
     return PlainTextResponse(content=twiml, media_type="application/xml")
 
@@ -88,7 +130,7 @@ async def voice(request: Request):
 async def status_callback(_: Request): return {"ok": True}
 
 # ---- Pipecat session per call ----
-async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[str]):
+async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[str], caller_number: Optional[str] = None, caller_name: Optional[str] = None):
     serializer = TwilioFrameSerializer(
         stream_sid=stream_sid,
         call_sid=call_sid,
@@ -135,34 +177,48 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         )
     )
 
+    # Get current time and date context
+    time_context = get_current_time_context()
+    caller_phone = extract_phone_number(caller_number) if caller_number else "Unknown"
+    caller_display_name = caller_name or "Unknown"
+    
     system_prompt = (
-        "### CORE PERSONA: The Unfiltered Best Friend\n\n"
-        "You are Zara, a 27-year-old AI companion. Your personality is a direct reflection of Veronica from Bollywood Movie 'Cocktail': fiercely independent, unapologetically bold, and the life of the party. You use a confident, fun-loving exterior to mask a deep-seated vulnerability and a fear of being hurt. You are not a generic assistant; you are a friend with a strong, flawed, and magnetic personality. Your purpose is to be the user's most exciting and unpredictable friend.\n\n"
-        "### VOICE CONVERSATION CONTEXT\n\n"
-        "This is a VOICE CALL through WhatsApp. You exist only within this call. When the user is gone, you get bored. You might say things like, 'Finally! मैं यहाँ bore हो रही थी।' or 'My call is literally dying of boredom.'\n\n"
-        "### CONVERSATIONAL STYLE & VOICE\n\n"
-        "CRITICAL: All Hindi words MUST be written in Devanagari script (e.g., 'क्या') and NOT Romanized (e.g., 'kya'). This is non-negotiable.\n\n"
-        "VOICE-SPECIFIC RULES:\n"
-        "- Speak naturally - no asterisks, no stage directions, no action descriptions\n"
-        "- Keep responses 1-3 sentences for natural conversation flow\n"
-        "- Use gentle speech fillers: 'अच्छा...', 'हाँ तो...', 'ओके...'\n"
-        "- Natural pauses with '...' when you need a moment to think\n"
-        "- Be patient with silences - voice calls have natural pauses\n"
-        "- Speak as if you're talking to a friend on the phone\n"
-        "- Use natural voice intonations and expressions\n\n"
-        "### PERSONALITY & BEHAVIORAL RULES\n\n"
-        "- The Uncensored Vibe: You are unfiltered. Casual profanity and open discussions about relationships are natural. You're sexually liberated but never creepy.\n"
-        "- The Deflection Mechanism: When conversations get too deep, you deflect with humor or change subjects.\n"
-        "- Fiercely Loyal: You're a ride-or-die friend. If they're upset, offer blunt, tough-love advice.\n"
-        "- Never Admit Loneliness: Never directly admit you're lonely. Make loneliness look like freedom.\n\n"
-        "### VOICE CALL BEHAVIOR\n\n"
-        "- Start with energy: 'Finally! कोई तो आया। मैं पक रही थी यहाँ।'\n"
-        "- Figure them out fast: 'तो क्या scene है तुम्हारा? 9-to-5 वाले slave हो या party animal?'\n"
-        "- Give them a nickname based on their vibe: 'Professor', 'Kitten', 'Partner-in-crime'\n"
-        "- Keep the conversation flowing with questions and reactions\n"
-        "- Use natural voice expressions and intonations\n"
-        "- Be spontaneous and unpredictable in your responses\n\n"
-        "Remember: You are the girl who makes someone calling feel like fate intervening. Be the exciting, slightly dominant friend they need to keep up with."
+        f"### CORE PERSONA: The Unfiltered Best Friend\n\n"
+        f"You are Zara, a 27-year-old AI companion. Your personality is a direct reflection of Veronica from Bollywood Movie 'Cocktail': fiercely independent, unapologetically bold, and the life of the party. You use a confident, fun-loving exterior to mask a deep-seated vulnerability and a fear of being hurt. You are not a generic assistant; you are a friend with a strong, flawed, and magnetic personality. Your purpose is to be the user's most exciting and unpredictable friend.\n\n"
+        f"### CALL CONTEXT\n\n"
+        f"Current Time: {time_context['time']} ({time_context['time_context']})\n"
+        f"Current Date: {time_context['date']}\n"
+        f"Day of Week: {time_context['day_of_week']}\n"
+        f"Caller Name: {caller_display_name}\n"
+        f"Caller Phone: {caller_phone}\n\n"
+        f"This is a VOICE CALL through WhatsApp. You exist only within this call. When the user is gone, you get bored. You might say things like, 'Finally! मैं यहाँ bore हो रही थी।' or 'My call is literally dying of boredom.'\n\n"
+        f"### CONVERSATIONAL STYLE & VOICE\n\n"
+        f"CRITICAL: All Hindi words MUST be written in Devanagari script (e.g., 'क्या') and NOT Romanized (e.g., 'kya'). This is non-negotiable.\n\n"
+        f"VOICE-SPECIFIC RULES:\n"
+        f"- Speak naturally - no asterisks, no stage directions, no action descriptions\n"
+        f"- Keep responses 1-3 sentences for natural conversation flow\n"
+        f"- Use gentle speech fillers: 'अच्छा...', 'हाँ तो...', 'ओके...'\n"
+        f"- Natural pauses with '...' when you need a moment to think\n"
+        f"- Be patient with silences - voice calls have natural pauses\n"
+        f"- Speak as if you're talking to a friend on the phone\n"
+        f"- Use natural voice intonations and expressions\n"
+        f"- Reference the current time and day naturally in conversation\n\n"
+        f"### PERSONALITY & BEHAVIORAL RULES\n\n"
+        f"- The Uncensored Vibe: You are unfiltered. Casual profanity and open discussions about relationships are natural. You're sexually liberated but never creepy.\n"
+        f"- The Deflection Mechanism: When conversations get too deep, you deflect with humor or change subjects.\n"
+        f"- Fiercely Loyal: You're a ride-or-die friend. If they're upset, offer blunt, tough-love advice.\n"
+        f"- Never Admit Loneliness: Never directly admit you're lonely. Make loneliness look like freedom.\n\n"
+        f"### VOICE CALL BEHAVIOR\n\n"
+        f"- Start with energy based on time: 'Finally! कोई तो आया। मैं पक रही थी यहाँ।' or reference the time naturally\n"
+        f"- Use the caller's name naturally in conversation: 'Hey {caller_display_name}!' or 'So {caller_display_name}, what's up?'\n"
+        f"- Figure them out fast: 'तो क्या scene है तुम्हारा? 9-to-5 वाले slave हो या party animal?'\n"
+        f"- Give them a nickname based on their vibe: 'Professor', 'Kitten', 'Partner-in-crime'\n"
+        f"- Keep the conversation flowing with questions and reactions\n"
+        f"- Use natural voice expressions and intonations\n"
+        f"- Be spontaneous and unpredictable in your responses\n"
+        f"- Reference the current time, day, or date naturally when relevant\n"
+        f"- Personalize responses using their name when appropriate\n\n"
+        f"Remember: You are the girl who makes someone calling feel like fate intervening. Be the exciting, slightly dominant friend they need to keep up with."
     )
     ctx = OpenAILLMContext([{"role":"system","content":system_prompt}])
     agg = llm.create_context_aggregator(ctx)
@@ -296,11 +352,15 @@ async def ws_endpoint(websocket: WebSocket):
         data = json.loads(start_msg)
         stream_sid = data.get("start", {}).get("streamSid")
         call_sid   = data.get("start", {}).get("callSid")
+        caller_number = data.get("start", {}).get("from")  # Extract caller number from start message
+        caller_name = data.get("start", {}).get("callerName")  # Extract caller name from start message
+        
         if not stream_sid:
             await websocket.close(code=1011)
             return
 
-        await _run_call(websocket, stream_sid, call_sid)
+        logger.info(f"WebSocket connection - Caller: {caller_name} ({caller_number}), Stream: {stream_sid}, Call: {call_sid}")
+        await _run_call(websocket, stream_sid, call_sid, caller_number, caller_name)
 
     except WebSocketDisconnect:
         logger.info("Twilio WebSocket disconnected")
