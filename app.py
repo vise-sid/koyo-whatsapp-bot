@@ -72,20 +72,18 @@ ELEVENLABS_API_KEY  = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "Rachel")
 VALIDATE_TWILIO_SIGNATURE = os.getenv("VALIDATE_TWILIO_SIGNATURE", "false").lower() == "true"
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+15557344000")  # Your Twilio WhatsApp number
-TWILIO_WHATSAPP_TEMPLATE = os.getenv("TWILIO_WHATSAPP_TEMPLATE", "koyo_message")  # WhatsApp message template name
 
 class WhatsAppMessagingService:
     """Service for sending WhatsApp messages via Twilio"""
     
-    def __init__(self, account_sid: str, auth_token: str, from_number: str, template_name: str = None):
+    def __init__(self, account_sid: str, auth_token: str, from_number: str):
         self.client = Client(account_sid, auth_token)
         self.from_number = from_number
-        self.template_name = template_name
         self.logger = logging.getLogger(__name__)
     
     async def send_message(self, to_number: str, message: str, recipient_name: str = "User") -> Dict[str, Any]:
         """
-        Send a WhatsApp message using the approved template
+        Send a WhatsApp message using the approved koyo_simple template
         
         Args:
             to_number: The recipient's phone number (with country code, e.g., +1234567890)
@@ -105,64 +103,28 @@ class WhatsAppMessagingService:
             if not from_number.startswith("whatsapp:"):
                 from_number = f"whatsapp:{from_number}"
             
-            # Use the approved WhatsApp template
-            if self.template_name:
-                try:
-                    message_obj = self.client.messages.create(
-                        from_=from_number,
-                        to=to_number,
-                        template={
-                            'name': self.template_name,
-                            'language': 'en',
-                            'components': [
-                                {
-                                    'type': 'body',
-                                    'parameters': [
-                                        {'type': 'text', 'text': recipient_name},
-                                        {'type': 'text', 'text': message}
-                                    ]
-                                }
-                            ]
-                        }
-                    )
-                    self.logger.info(f"WhatsApp template message sent - SID: {message_obj.sid}, To: {to_number}, Template: {self.template_name}")
-                    
-                    return {
-                        "success": True,
-                        "message_sid": message_obj.sid,
-                        "status": message_obj.status,
-                        "to": to_number,
-                        "message": message,
-                        "template_used": True,
-                        "template_name": self.template_name
-                    }
-                    
-                except Exception as template_error:
-                    self.logger.error(f"Template messaging failed: {template_error}")
-                    return {
-                        "success": False,
-                        "error": f"Template messaging failed: {str(template_error)}",
-                        "to": to_number,
-                        "message": message,
-                        "template_used": False
-                    }
-            else:
-                # Fallback to direct messaging if no template configured
-                message_obj = self.client.messages.create(
-                    body=message,
-                    from_=from_number,
-                    to=to_number
-                )
-                self.logger.info(f"WhatsApp direct message sent - SID: {message_obj.sid}, To: {to_number}")
-                
-                return {
-                    "success": True,
-                    "message_sid": message_obj.sid,
-                    "status": message_obj.status,
-                    "to": to_number,
-                    "message": message,
-                    "template_used": False
-                }
+            # Use the approved koyo_simple template with content_sid
+            message_obj = self.client.messages.create(
+                from_=from_number,
+                to=to_number,
+                content_sid="HXe35b0e8a3ebf215e7407f5131ea03510",  # koyo_simple template SID
+                content_variables=json.dumps({
+                    "1": recipient_name,
+                    "2": message
+                })
+            )
+            
+            self.logger.info(f"WhatsApp template message sent - SID: {message_obj.sid}, To: {to_number}")
+            
+            return {
+                "success": True,
+                "message_sid": message_obj.sid,
+                "status": message_obj.status,
+                "to": to_number,
+                "message": message,
+                "template_used": True,
+                "template_name": "koyo_simple"
+            }
             
         except Exception as e:
             self.logger.error(f"Failed to send WhatsApp message to {to_number}: {str(e)}")
@@ -227,8 +189,7 @@ async def test_whatsapp_message(request: Request):
         whatsapp_service = WhatsAppMessagingService(
             account_sid=TWILIO_ACCOUNT_SID,
             auth_token=TWILIO_AUTH_TOKEN,
-            from_number=TWILIO_WHATSAPP_FROM,
-            template_name=TWILIO_WHATSAPP_TEMPLATE
+            from_number=TWILIO_WHATSAPP_FROM
         )
         
         # Send test message using template
@@ -258,8 +219,8 @@ async def whatsapp_status():
             "twilio_auth_token": bool(TWILIO_AUTH_TOKEN),
             "twilio_whatsapp_from": bool(TWILIO_WHATSAPP_FROM),
             "whatsapp_from_number": TWILIO_WHATSAPP_FROM,
-            "whatsapp_template": TWILIO_WHATSAPP_TEMPLATE,
-            "template_configured": bool(TWILIO_WHATSAPP_TEMPLATE)
+            "whatsapp_template": "koyo_simple",
+            "template_sid": "HXe35b0e8a3ebf215e7407f5131ea03510"
         }
         
         # Test Twilio client initialization
@@ -389,8 +350,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     whatsapp_service = WhatsAppMessagingService(
         account_sid=TWILIO_ACCOUNT_SID,
         auth_token=TWILIO_AUTH_TOKEN,
-        from_number=TWILIO_WHATSAPP_FROM,
-        template_name=TWILIO_WHATSAPP_TEMPLATE
+        from_number=TWILIO_WHATSAPP_FROM
     )
     
     # Define WhatsApp function schema using Pipecat's FunctionSchema
