@@ -8,11 +8,11 @@ from twilio.request_validator import RequestValidator
 
 # -------- Pipecat pieces --------
 from pipecat.serializers.twilio import TwilioFrameSerializer
-from pipecat.transports.network.fastapi_websocket import (
+from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport, FastAPIWebsocketParams
 )
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.pipeline import Pipeline
+from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask
 from pipecat.pipeline.params import PipelineParams
 from pipecat.pipeline.runner import PipelineRunner
@@ -170,3 +170,4 @@ async def ws_endpoint(websocket: WebSocket):
             await websocket.close(code=1011)
         except Exception:
             pass
+
