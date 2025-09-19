@@ -420,7 +420,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     tts = ElevenLabsTTSService(
         api_key=ELEVENLABS_API_KEY,
         voice_id=ELEVENLABS_VOICE_ID,
-        model="eleven_multilingual_v2",  # Better quality model for multilingual support
+        model="eleven_flash_v2_5",  # Better quality model for multilingual support
         input_params=ElevenLabsTTSService.InputParams(
             language=Language.HI,  # Hindi for Zara's character
             stability=0.75,  # Increased for more consistent quality
