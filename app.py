@@ -27,6 +27,9 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.transcriptions.language import Language
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.services.llm_service import FunctionCallParams
 
 logger = logging.getLogger("uvicorn.error")
 app = FastAPI(title="Pipecat x Twilio WhatsApp Calling")
@@ -336,69 +339,66 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         from_number=TWILIO_WHATSAPP_FROM
     )
     
-    # Define function schema for OpenAI
-    whatsapp_function_schema = {
-        "name": "send_whatsapp_message",
-        "description": "Send a WhatsApp text message to a user during the conversation. Use this when the user asks you to send them a message, reminder, or any text via WhatsApp.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "to_number": {
-                    "type": "string",
-                    "description": "The recipient's phone number with country code (e.g., +1234567890). If not provided, use the caller's number."
-                },
-                "message": {
-                    "type": "string",
-                    "description": "The message content to send via WhatsApp"
-                }
+    # Define WhatsApp function schema using Pipecat's FunctionSchema
+    whatsapp_function = FunctionSchema(
+        name="send_whatsapp_message",
+        description="Send a WhatsApp text message to a user during the conversation. Use this when the user asks you to send them a message, reminder, or any text via WhatsApp.",
+        properties={
+            "to_number": {
+                "type": "string",
+                "description": "The recipient's phone number with country code (e.g., +1234567890). If not provided, use the caller's number."
             },
-            "required": ["message"]
-        }
-    }
+            "message": {
+                "type": "string",
+                "description": "The message content to send via WhatsApp"
+            }
+        },
+        required=["message"]
+    )
     
-    # Create a custom function call handler class
-    class WhatsAppFunctionHandler:
-        def __init__(self, whatsapp_service, caller_phone):
-            self.whatsapp_service = whatsapp_service
-            self.caller_phone = caller_phone
-            self.logger = logging.getLogger(__name__)
-        
-        async def handle_function_call(self, function_name: str, arguments: dict) -> str:
-            """Handle function calls from the LLM"""
-            if function_name == "send_whatsapp_message":
-                try:
-                    # Get the phone number, use caller's number if not provided
-                    to_number = arguments.get("to_number", self.caller_phone)
-                    message = arguments.get("message", "")
-                    
-                    if not message:
-                        return "❌ No message content provided"
-                    
-                    # Send the WhatsApp message
-                    result = await self.whatsapp_service.send_message(to_number, message)
-                    
-                    if result["success"]:
-                        self.logger.info(f"WhatsApp message sent successfully: {result}")
-                        return f"✅ WhatsApp message sent successfully to {to_number}"
-                    else:
-                        self.logger.error(f"Failed to send WhatsApp message: {result}")
-                        return f"❌ Failed to send WhatsApp message: {result.get('error', 'Unknown error')}"
-                        
-                except Exception as e:
-                    self.logger.error(f"Error in WhatsApp function handler: {str(e)}")
-                    return f"❌ Error sending WhatsApp message: {str(e)}"
-            else:
-                return f"❌ Unknown function: {function_name}"
+    # Create tools schema
+    tools = ToolsSchema(standard_tools=[whatsapp_function])
     
-    # Initialize the function handler
-    function_handler = WhatsAppFunctionHandler(whatsapp_service, caller_phone)
-    
+    # Initialize LLM service
     llm = OpenAILLMService(
         api_key=OPENAI_API_KEY, 
         model="gpt-4o",
-        functions=[whatsapp_function_schema],
-        function_call_handler=function_handler.handle_function_call
+        params=OpenAILLMService.InputParams(
+            temperature=0.7,
+        )
     )
+    
+    # Register WhatsApp function handler
+    async def send_whatsapp_message_handler(params: FunctionCallParams):
+        """Handle WhatsApp message sending function calls"""
+        try:
+            # Get the phone number, use caller's number if not provided
+            to_number = params.arguments.get("to_number", caller_phone)
+            message = params.arguments.get("message", "")
+            
+            if not message:
+                result = "❌ No message content provided"
+                await params.result_callback(result)
+                return
+            
+            # Send the WhatsApp message
+            result = await whatsapp_service.send_message(to_number, message)
+            
+            if result["success"]:
+                logger.info(f"WhatsApp message sent successfully: {result}")
+                response = f"✅ WhatsApp message sent successfully to {to_number}"
+            else:
+                logger.error(f"Failed to send WhatsApp message: {result}")
+                response = f"❌ Failed to send WhatsApp message: {result.get('error', 'Unknown error')}"
+            
+            await params.result_callback(response)
+            
+        except Exception as e:
+            logger.error(f"Error in WhatsApp function handler: {str(e)}")
+            await params.result_callback(f"❌ Error sending WhatsApp message: {str(e)}")
+    
+    # Register the function handler with the LLM service
+    llm.register_function("send_whatsapp_message", send_whatsapp_message_handler)
     tts = ElevenLabsTTSService(
         api_key=ELEVENLABS_API_KEY,
         voice_id=ELEVENLABS_VOICE_ID,
@@ -464,7 +464,10 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         f"- Personalize responses using their name when appropriate\n\n"
         f"Remember: You are the girl who makes someone calling feel like fate intervening. Be the exciting, slightly dominant friend they need to keep up with."
     )
-    ctx = OpenAILLMContext([{"role":"system","content":system_prompt}])
+    ctx = OpenAILLMContext(
+        messages=[{"role":"system","content":system_prompt}],
+        tools=tools
+    )
     agg = llm.create_context_aggregator(ctx)
 
     # Timeout handling system
