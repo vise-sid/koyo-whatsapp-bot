@@ -528,8 +528,8 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            audio_in_sample_rate=24000,   # Higher quality sample rate
-            audio_out_sample_rate=24000,  # Match input sample rate for consistency
+            audio_in_sample_rate=16000,   # Silero VAD compatible sample rate
+            audio_out_sample_rate=16000,  # Match input sample rate for consistency
             allow_interruptions=True,
         ),
         idle_timeout_secs=600,  # 10 minutes total idle timeout
@@ -538,7 +538,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     @transport.event_handler("on_client_connected")
     async def _greet(_t, _c):
         logger.info("Client connected, sending greeting...")
-        logger.info(f"Audio quality settings - Sample rate: 24kHz, Bit depth: 16-bit, Channels: Mono")
+        logger.info(f"Audio quality settings - Sample rate: 16kHz, Bit depth: 16-bit, Channels: Mono")
         logger.info(f"TTS model: eleven_multilingual_v2, STT model: nova-3-general")
         await task.queue_frames([LLMRunFrame()])  # gentle hello
 
