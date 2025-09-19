@@ -1,15 +1,3 @@
-"""
-Koyo v9 - Enhanced Audio Quality WhatsApp Voice Assistant
-
-Audio Quality Improvements:
-- Upgraded to 16kHz sample rate (from 8kHz) for better audio fidelity
-- Enhanced ElevenLabs TTS with multilingual_v2 model and optimized voice settings
-- Improved Deepgram STT with audio enhancement and noise reduction
-- Optimized VAD (Voice Activity Detection) parameters for better responsiveness
-- Added audio quality monitoring and logging
-- Enhanced audio buffering and streaming parameters
-"""
-
 import asyncio
 import os, json, logging
 from typing import Optional
@@ -216,7 +204,6 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             interim_results=True,
             # Enhanced audio processing for better quality
             encoding="linear16",  # 16-bit linear PCM for better quality
-            sample_rate=16000,  # Match our sample rate
             channels=1,  # Mono audio
         )
     )
@@ -232,7 +219,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             style=0.3,  # Reduced for more natural speech
             use_speaker_boost=True,  # Enable for better voice clarity
             speed=0.9,  # Slightly faster for more natural flow
-            auto_mode=False,  # Disable for more control
+            auto_mode=True,
         )
     )
 
@@ -389,8 +376,8 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            audio_in_sample_rate=16000,   # Higher quality sample rate
-            audio_out_sample_rate=16000,  # Match input sample rate for consistency
+            audio_in_sample_rate=24000,   # Higher quality sample rate
+            audio_out_sample_rate=24000,  # Match input sample rate for consistency
             allow_interruptions=True,
         ),
         idle_timeout_secs=600,  # 10 minutes total idle timeout
@@ -399,7 +386,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     @transport.event_handler("on_client_connected")
     async def _greet(_t, _c):
         logger.info("Client connected, sending greeting...")
-        logger.info(f"Audio quality settings - Sample rate: 16kHz, Bit depth: 16-bit, Channels: Mono")
+        logger.info(f"Audio quality settings - Sample rate: 24kHz, Bit depth: 16-bit, Channels: Mono")
         logger.info(f"TTS model: eleven_multilingual_v2, STT model: nova-3-general")
         await task.queue_frames([LLMRunFrame()])  # gentle hello
 
