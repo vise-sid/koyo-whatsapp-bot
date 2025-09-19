@@ -1,3 +1,15 @@
+"""
+Koyo v9 - Enhanced Audio Quality WhatsApp Voice Assistant
+
+Audio Quality Improvements:
+- Upgraded to 16kHz sample rate (from 8kHz) for better audio fidelity
+- Enhanced ElevenLabs TTS with multilingual_v2 model and optimized voice settings
+- Improved Deepgram STT with audio enhancement and noise reduction
+- Optimized VAD (Voice Activity Detection) parameters for better responsiveness
+- Added audio quality monitoring and logging
+- Enhanced audio buffering and streaming parameters
+"""
+
 import asyncio
 import os, json, logging
 from typing import Optional
@@ -28,6 +40,35 @@ from pipecat.transcriptions.language import Language
 
 logger = logging.getLogger("uvicorn.error")
 app = FastAPI(title="Pipecat x Twilio WhatsApp Calling")
+
+# Global storage for caller information (in production, use Redis or database)
+caller_info_storage = {}
+
+async def cleanup_old_caller_info():
+    """Periodically clean up old caller info entries"""
+    import asyncio
+    while True:
+        try:
+            current_time = datetime.now()
+            expired_entries = []
+            
+            for call_sid, info in caller_info_storage.items():
+                # Remove entries older than 1 hour
+                if (current_time - info.get('timestamp', current_time)).total_seconds() > 3600:
+                    expired_entries.append(call_sid)
+            
+            for call_sid in expired_entries:
+                del caller_info_storage[call_sid]
+                logger.info(f"Cleaned up expired caller info for CallSid: {call_sid}")
+                
+            if expired_entries:
+                logger.info(f"Cleaned up {len(expired_entries)} expired caller info entries")
+                
+        except Exception as e:
+            logger.error(f"Error during caller info cleanup: {e}")
+        
+        # Run cleanup every 30 minutes
+        await asyncio.sleep(1800)
 
 # -------- Env --------
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
@@ -76,6 +117,12 @@ def extract_phone_number(whatsapp_number: str) -> str:
 @app.get("/health")
 def health(): return {"ok": True}
 
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks when the app starts"""
+    asyncio.create_task(cleanup_old_caller_info())
+    logger.info("Started caller info cleanup task")
+
 # ---- helpers ----
 def _ws_url(request: Request) -> str:
     host = request.headers.get("host")
@@ -120,8 +167,16 @@ async def voice(request: Request):
     
     logger.info(f"Voice webhook - From: {from_num}, To: {to_num}, Name: {caller_name}, CallSid: {call_sid}")
 
-    # Store caller info for later use in the call
-    # We'll pass this to the WebSocket connection
+    # Store caller info for later use in the WebSocket connection
+    if call_sid:
+        caller_info_storage[call_sid] = {
+            "caller_name": caller_name,
+            "caller_number": from_num,
+            "to_number": to_num,
+            "timestamp": datetime.now()
+        }
+        logger.info(f"Stored caller info for CallSid: {call_sid} - Name: {caller_name}, Number: {from_num}")
+    
     twiml = _twiml(_ws_url(request))
     return PlainTextResponse(content=twiml, media_type="application/xml")
 
@@ -144,10 +199,23 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=SileroVADAnalyzer(
+                min_silence_duration_ms=500,  # Reduced for more responsive detection
+                speech_pad_ms=200,  # Padding around speech
+                min_speech_duration_ms=250,  # Minimum speech duration
+                max_speech_duration_s=30,  # Maximum speech duration
+                energy_threshold=0.5,  # Voice activity detection threshold
+            ),
             serializer=serializer,
             audio_in_format="pcm",
             audio_out_format="pcm",
+            # Enhanced audio processing parameters
+            audio_in_sample_rate=16000,  # Higher sample rate for better quality
+            audio_out_sample_rate=16000,  # Match input for consistency
+            audio_in_channels=1,  # Mono input
+            audio_out_channels=1,  # Mono output
+            audio_in_bit_depth=16,  # 16-bit depth for better quality
+            audio_out_bit_depth=16,  # 16-bit depth for better quality
         ),
     )
 
@@ -159,21 +227,40 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             language="multi",
             smart_format=True,
             interim_results=True,
+            # Enhanced audio processing for better quality
+            encoding="linear16",  # 16-bit linear PCM for better quality
+            sample_rate=16000,  # Match our sample rate
+            channels=1,  # Mono audio
+            # Noise reduction and enhancement
+            enhance=True,  # Enable audio enhancement
+            punctuate=True,  # Add punctuation for better text quality
+            profanity_filter=False,  # Allow natural speech patterns
+            redact=False,  # Don't redact sensitive info
+            diarize=False,  # No speaker diarization needed
+            multichannel=False,  # Single channel
+            alternatives=1,  # Single alternative for faster processing
+            numerals=True,  # Convert numbers to digits
+            search=[""],  # No keyword search
+            replace=[""],  # No text replacement
+            keywords=[""],  # No keyword boosting
+            # Voice activity detection
+            vad_events=True,  # Enable VAD events
+            endpointing=300,  # Endpoint detection in ms
         )
     )
     llm = OpenAILLMService(api_key=OPENAI_API_KEY, model="gpt-4o")
     tts = ElevenLabsTTSService(
         api_key=ELEVENLABS_API_KEY,
         voice_id=ELEVENLABS_VOICE_ID,
-        model="eleven_turbo_v2_5",  # Latest and fastest model
+        model="eleven_multilingual_v2",  # Better quality model for multilingual support
         input_params=ElevenLabsTTSService.InputParams(
             language=Language.HI,  # Hindi for Zara's character
-            stability=0.5,
-            similarity_boost=0.8,
-            style=0.5,
-            use_speaker_boost=False,
-            speed=0.85,
-            auto_mode=True
+            stability=0.75,  # Increased for more consistent quality
+            similarity_boost=0.9,  # Higher for better voice matching
+            style=0.3,  # Reduced for more natural speech
+            use_speaker_boost=True,  # Enable for better voice clarity
+            speed=0.9,  # Slightly faster for more natural flow
+            auto_mode=False,  # Disable for more control
         )
     )
 
@@ -226,7 +313,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     # Timeout handling system
     def get_timeout_for_retry(retry_count: int) -> float:
         """Return timeout value based on retry count"""
-        timeout_values = [15.0, 8.0, 4.0, 3.0]
+        timeout_values = [10.0, 8.0, 4.0, 3.0]
         return timeout_values[min(retry_count - 1, len(timeout_values) - 1)]
 
     async def handle_user_idle_with_retry(user_idle: UserIdleProcessor, retry_count: int) -> bool:
@@ -304,6 +391,11 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         
         # Clean up transport
         await transport.cleanup()
+        
+        # Clean up stored caller info
+        if call_sid and call_sid in caller_info_storage:
+            del caller_info_storage[call_sid]
+            logger.info(f"Cleaned up caller info for CallSid: {call_sid}")
 
     # Use the retry callback pattern - UserIdleProcessor handles reset automatically
     user_idle = UserIdleProcessor(
@@ -325,9 +417,14 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            audio_in_sample_rate=8000,   # Twilio Media Streams: 8kHz μ-law from WhatsApp/Voice
-            audio_out_sample_rate=8000,  # Match input sample rate for Twilio
+            audio_in_sample_rate=16000,   # Higher quality sample rate
+            audio_out_sample_rate=16000,  # Match input sample rate for consistency
             allow_interruptions=True,
+            # Enhanced audio processing
+            audio_in_channels=1,
+            audio_out_channels=1,
+            audio_in_bit_depth=16,
+            audio_out_bit_depth=16,
         ),
         idle_timeout_secs=600,  # 10 minutes total idle timeout
     )
@@ -335,9 +432,45 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     @transport.event_handler("on_client_connected")
     async def _greet(_t, _c):
         logger.info("Client connected, sending greeting...")
+        logger.info(f"Audio quality settings - Sample rate: 16kHz, Bit depth: 16-bit, Channels: Mono")
+        logger.info(f"TTS model: eleven_multilingual_v2, STT model: nova-3-general")
         await task.queue_frames([LLMRunFrame()])  # gentle hello
 
-    runner = PipelineRunner(handle_sigint=False, force_gc=True)
+    @transport.event_handler("on_audio_frame")
+    async def _on_audio_frame(transport, frame):
+        """Monitor audio frame quality"""
+        if hasattr(frame, 'audio') and frame.audio:
+            audio_data = frame.audio
+            # Log audio quality metrics periodically
+            if hasattr(transport, '_frame_count'):
+                transport._frame_count += 1
+            else:
+                transport._frame_count = 1
+            
+            # Log every 100 frames (roughly every 2-3 seconds)
+            if transport._frame_count % 100 == 0:
+                logger.info(f"Audio quality check - Frame {transport._frame_count}, "
+                          f"Data length: {len(audio_data) if audio_data else 0}")
+
+    @transport.event_handler("on_tts_start")
+    async def _on_tts_start(transport, frame):
+        """Log when TTS starts"""
+        logger.info("TTS audio generation started")
+
+    @transport.event_handler("on_tts_end")
+    async def _on_tts_end(transport, frame):
+        """Log when TTS ends"""
+        logger.info("TTS audio generation completed")
+
+    # Enhanced pipeline runner with better audio processing
+    runner = PipelineRunner(
+        handle_sigint=False, 
+        force_gc=True,
+        # Audio processing optimizations
+        audio_buffer_size=4096,  # Larger buffer for smoother audio
+        audio_chunk_size=1024,   # Optimal chunk size for real-time processing
+        max_audio_latency_ms=100,  # Maximum acceptable latency
+    )
     await runner.run(task)
 
 # ---- WebSocket endpoint for Media Streams ----
@@ -352,8 +485,24 @@ async def ws_endpoint(websocket: WebSocket):
         data = json.loads(start_msg)
         stream_sid = data.get("start", {}).get("streamSid")
         call_sid   = data.get("start", {}).get("callSid")
-        caller_number = data.get("start", {}).get("from")  # Extract caller number from start message
-        caller_name = data.get("start", {}).get("callerName")  # Extract caller name from start message
+        
+        # Try to get caller info from WebSocket start message first
+        caller_number = data.get("start", {}).get("from")
+        caller_name = data.get("start", {}).get("callerName")
+        
+        # If not available in WebSocket message, retrieve from stored info
+        if call_sid and call_sid in caller_info_storage:
+            stored_info = caller_info_storage[call_sid]
+            caller_name = caller_name or stored_info.get("caller_name", "Unknown")
+            caller_number = caller_number or stored_info.get("caller_number", "Unknown")
+            logger.info(f"Retrieved caller info from storage - Name: {caller_name}, Number: {caller_number}")
+        else:
+            logger.warning(f"No stored caller info found for CallSid: {call_sid}")
+            # Fallback: try to extract from WebSocket data or use defaults
+            if not caller_name:
+                caller_name = "Unknown"
+            if not caller_number:
+                caller_number = "Unknown"
         
         if not stream_sid:
             await websocket.close(code=1011)
@@ -364,8 +513,16 @@ async def ws_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         logger.info("Twilio WebSocket disconnected")
+        # Clean up stored caller info on disconnect
+        if 'call_sid' in locals() and call_sid and call_sid in caller_info_storage:
+            del caller_info_storage[call_sid]
+            logger.info(f"Cleaned up caller info on disconnect for CallSid: {call_sid}")
     except Exception as e:
         logger.exception("WS error: %s", e)
+        # Clean up stored caller info on error
+        if 'call_sid' in locals() and call_sid and call_sid in caller_info_storage:
+            del caller_info_storage[call_sid]
+            logger.info(f"Cleaned up caller info on error for CallSid: {call_sid}")
         try:
             await websocket.close(code=1011)
         except Exception:
