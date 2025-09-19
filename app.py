@@ -386,6 +386,12 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     async def send_whatsapp_message_handler(params: FunctionCallParams):
         """Handle WhatsApp message sending function calls"""
         try:
+            # Check if connection is still active
+            if hasattr(transport, '_websocket') and transport._websocket.client_state.name != 'CONNECTED':
+                logger.info("Connection closed, skipping WhatsApp message")
+                await params.result_callback("❌ Connection closed, cannot send message")
+                return
+            
             # Get the phone number, use caller's number if not provided
             to_number = params.arguments.get("to_number", caller_phone)
             message = params.arguments.get("message", "")
@@ -501,6 +507,11 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         """
         logger.info(f"User idle - attempt #{retry_count}")
         
+        # Check if the connection is still active
+        if hasattr(transport, '_websocket') and transport._websocket.client_state.name != 'CONNECTED':
+            logger.info("Connection closed, stopping idle monitoring")
+            return False
+        
         # Update timeout for next retry
         next_timeout = get_timeout_for_retry(retry_count + 1)
         user_idle._timeout = next_timeout
@@ -551,12 +562,23 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     async def terminate_call_after_goodbye():
         """Terminate the call after giving time for goodbye message to be spoken"""
         logger.info("Terminating call due to user inactivity")
+        
+        # Check if connection is still active before proceeding
+        if hasattr(transport, '_websocket') and transport._websocket.client_state.name != 'CONNECTED':
+            logger.info("Connection already closed, skipping termination")
+            return
+        
         await task.queue_frames([EndFrame()])
         
         # Wait for the bot to finish speaking before ending
         max_wait_time = 20  # Maximum 20 seconds
         wait_time = 0
         while wait_time < max_wait_time:
+            # Check if connection is still active
+            if hasattr(transport, '_websocket') and transport._websocket.client_state.name != 'CONNECTED':
+                logger.info("Connection closed during termination, stopping")
+                break
+                
             # Check if bot is still speaking
             if hasattr(transport, '_bot_speaking') and not transport._bot_speaking:
                 logger.info("Bot finished speaking, proceeding to end call")
