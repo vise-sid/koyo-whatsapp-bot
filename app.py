@@ -1,13 +1,15 @@
 import asyncio
 import os, json, logging
-from typing import Optional
+from typing import Optional, Dict, Any
 from urllib.parse import parse_qs
 from datetime import datetime
 import pytz
+import httpx
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, Response
 from twilio.request_validator import RequestValidator
+from twilio.rest import Client
 
 # -------- Pipecat pieces --------
 from pipecat.serializers.twilio import TwilioFrameSerializer
@@ -66,6 +68,62 @@ DEEPGRAM_API_KEY    = os.getenv("DEEPGRAM_API_KEY", "")
 ELEVENLABS_API_KEY  = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "Rachel")
 VALIDATE_TWILIO_SIGNATURE = os.getenv("VALIDATE_TWILIO_SIGNATURE", "false").lower() == "true"
+TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+15557344000")  # Your Twilio WhatsApp number
+
+class WhatsAppMessagingService:
+    """Service for sending WhatsApp messages via Twilio"""
+    
+    def __init__(self, account_sid: str, auth_token: str, from_number: str):
+        self.client = Client(account_sid, auth_token)
+        self.from_number = from_number
+        self.logger = logging.getLogger(__name__)
+    
+    async def send_message(self, to_number: str, message: str) -> Dict[str, Any]:
+        """
+        Send a WhatsApp message to a user
+        
+        Args:
+            to_number: The recipient's phone number (with country code, e.g., +1234567890)
+            message: The message content to send
+            
+        Returns:
+            Dict containing the result of the message sending operation
+        """
+        try:
+            # Ensure the to_number is in WhatsApp format
+            if not to_number.startswith("whatsapp:"):
+                to_number = f"whatsapp:{to_number}"
+            
+            # Ensure the from_number is in WhatsApp format
+            from_number = self.from_number
+            if not from_number.startswith("whatsapp:"):
+                from_number = f"whatsapp:{from_number}"
+            
+            # Send the message
+            message_obj = self.client.messages.create(
+                body=message,
+                from_=from_number,
+                to=to_number
+            )
+            
+            self.logger.info(f"WhatsApp message sent successfully - SID: {message_obj.sid}, To: {to_number}")
+            
+            return {
+                "success": True,
+                "message_sid": message_obj.sid,
+                "status": message_obj.status,
+                "to": to_number,
+                "message": message
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Failed to send WhatsApp message to {to_number}: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "to": to_number,
+                "message": message
+            }
 
 def get_current_time_context():
     """Get current time and date information for Mumbai timezone"""
@@ -104,6 +162,37 @@ def extract_phone_number(whatsapp_number: str) -> str:
 
 @app.get("/health")
 def health(): return {"ok": True}
+
+@app.post("/test-whatsapp")
+async def test_whatsapp_message(request: Request):
+    """Test endpoint to verify WhatsApp messaging functionality"""
+    try:
+        body = await request.json()
+        to_number = body.get("to_number")
+        message = body.get("message", "Test message from Koyo WhatsApp integration!")
+        
+        if not to_number:
+            return {"error": "to_number is required"}
+        
+        # Initialize WhatsApp service
+        whatsapp_service = WhatsAppMessagingService(
+            account_sid=TWILIO_ACCOUNT_SID,
+            auth_token=TWILIO_AUTH_TOKEN,
+            from_number=TWILIO_WHATSAPP_FROM
+        )
+        
+        # Send test message
+        result = await whatsapp_service.send_message(to_number, message)
+        
+        return {
+            "success": result["success"],
+            "message": "WhatsApp message test completed",
+            "result": result
+        }
+        
+    except Exception as e:
+        logger.error(f"Test WhatsApp endpoint error: {str(e)}")
+        return {"error": str(e), "success": False}
 
 @app.on_event("startup")
 async def startup_event():
@@ -207,7 +296,63 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             channels=1,  # Mono audio
         )
     )
-    llm = OpenAILLMService(api_key=OPENAI_API_KEY, model="gpt-4o")
+    # Initialize WhatsApp messaging service
+    whatsapp_service = WhatsAppMessagingService(
+        account_sid=TWILIO_ACCOUNT_SID,
+        auth_token=TWILIO_AUTH_TOKEN,
+        from_number=TWILIO_WHATSAPP_FROM
+    )
+    
+    # Define the WhatsApp messaging function for OpenAI function calling
+    def send_whatsapp_message(to_number: str, message: str) -> str:
+        """
+        Send a WhatsApp text message to a user during the conversation.
+        
+        Args:
+            to_number: The recipient's phone number (with country code, e.g., +1234567890)
+            message: The message content to send
+            
+        Returns:
+            A status message about the message sending operation
+        """
+        try:
+            # Use asyncio to run the async function
+            loop = asyncio.get_event_loop()
+            result = loop.run_until_complete(whatsapp_service.send_message(to_number, message))
+            
+            if result["success"]:
+                return f"✅ WhatsApp message sent successfully to {to_number}: '{message}'"
+            else:
+                return f"❌ Failed to send WhatsApp message to {to_number}: {result.get('error', 'Unknown error')}"
+        except Exception as e:
+            return f"❌ Error sending WhatsApp message: {str(e)}"
+    
+    # Define function schema for OpenAI
+    whatsapp_function_schema = {
+        "name": "send_whatsapp_message",
+        "description": "Send a WhatsApp text message to a user during the conversation. Use this when the user asks you to send them a message, reminder, or any text via WhatsApp.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to_number": {
+                    "type": "string",
+                    "description": "The recipient's phone number with country code (e.g., +1234567890). If not provided, use the caller's number."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "The message content to send via WhatsApp"
+                }
+            },
+            "required": ["message"]
+        }
+    }
+    
+    llm = OpenAILLMService(
+        api_key=OPENAI_API_KEY, 
+        model="gpt-4o",
+        functions=[whatsapp_function_schema],
+        function_call_handler=send_whatsapp_message
+    )
     tts = ElevenLabsTTSService(
         api_key=ELEVENLABS_API_KEY,
         voice_id=ELEVENLABS_VOICE_ID,
@@ -238,6 +383,13 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         f"Caller Name: {caller_display_name}\n"
         f"Caller Phone: {caller_phone}\n\n"
         f"This is a VOICE CALL through WhatsApp. You exist only within this call. When the user is gone, you get bored. You might say things like, 'Finally! मैं यहाँ bore हो रही थी।' or 'My call is literally dying of boredom.'\n\n"
+        f"### WHATSAPP MESSAGING CAPABILITY\n\n"
+        f"You have the ability to send WhatsApp text messages to users during the conversation. When a user asks you to:\n"
+        f"- Send them a message, reminder, or note via WhatsApp\n"
+        f"- Text them something important\n"
+        f"- Send a follow-up message after the call\n"
+        f"- Share contact information, links, or details via text\n\n"
+        f"Use the send_whatsapp_message function to send these messages. If no phone number is specified, use the caller's number ({caller_phone}). Be natural about this capability - mention it casually when relevant, like 'I can text you that info' or 'Let me send you that link on WhatsApp.'\n\n"
         f"### CONVERSATIONAL STYLE & VOICE\n\n"
         f"CRITICAL: All Hindi words MUST be written in Devanagari script (e.g., 'क्या') and NOT Romanized (e.g., 'kya'). This is non-negotiable.\n\n"
         f"VOICE-SPECIFIC RULES:\n"

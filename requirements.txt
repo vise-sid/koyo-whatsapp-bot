@@ -3,6 +3,7 @@ uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 twilio==9.2.3
 pytz>=2023.3
+httpx>=0.25.0
 
 # Pipecat and extras for FastAPI websockets, Deepgram STT, ElevenLabs TTS, OpenAI LLM, Silero VAD
 pipecat-ai[websocket,deepgram,elevenlabs,openai,silero]>=0.0.80
