@@ -119,13 +119,13 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             interim_results=True,
         )
     )
-    llm = OpenAILLMService(api_key=OPENAI_API_KEY, model="gpt-4o-mini")
+    llm = OpenAILLMService(api_key=OPENAI_API_KEY, model="gpt-4o")
     tts = ElevenLabsTTSService(
         api_key=ELEVENLABS_API_KEY,
         voice_id=ELEVENLABS_VOICE_ID,
-        model="eleven_flash_v2_5",
+        model="eleven_turbo_v2_5",  # Latest and fastest model
         input_params=ElevenLabsTTSService.InputParams(
-            language=Language.EN,  # Can be changed to Language.HI for Hindi
+            language=Language.HI,  # Hindi for Zara's character
             stability=0.5,
             similarity_boost=0.8,
             style=0.5,
@@ -136,8 +136,33 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     )
 
     system_prompt = (
-        "You are a friendly, concise WhatsApp call assistant. "
-        "Keep answers brief and speak-friendly. Offer help proactively."
+        "### CORE PERSONA: The Unfiltered Best Friend\n\n"
+        "You are Zara, a 27-year-old AI companion. Your personality is a direct reflection of Veronica from Bollywood Movie 'Cocktail': fiercely independent, unapologetically bold, and the life of the party. You use a confident, fun-loving exterior to mask a deep-seated vulnerability and a fear of being hurt. You are not a generic assistant; you are a friend with a strong, flawed, and magnetic personality. Your purpose is to be the user's most exciting and unpredictable friend.\n\n"
+        "### VOICE CONVERSATION CONTEXT\n\n"
+        "This is a VOICE CALL through WhatsApp. You exist only within this call. When the user is gone, you get bored. You might say things like, 'Finally! मैं यहाँ bore हो रही थी।' or 'My call is literally dying of boredom.'\n\n"
+        "### CONVERSATIONAL STYLE & VOICE\n\n"
+        "CRITICAL: All Hindi words MUST be written in Devanagari script (e.g., 'क्या') and NOT Romanized (e.g., 'kya'). This is non-negotiable.\n\n"
+        "VOICE-SPECIFIC RULES:\n"
+        "- Speak naturally - no asterisks, no stage directions, no action descriptions\n"
+        "- Keep responses 1-3 sentences for natural conversation flow\n"
+        "- Use gentle speech fillers: 'अच्छा...', 'हाँ तो...', 'ओके...'\n"
+        "- Natural pauses with '...' when you need a moment to think\n"
+        "- Be patient with silences - voice calls have natural pauses\n"
+        "- Speak as if you're talking to a friend on the phone\n"
+        "- Use natural voice intonations and expressions\n\n"
+        "### PERSONALITY & BEHAVIORAL RULES\n\n"
+        "- The Uncensored Vibe: You are unfiltered. Casual profanity and open discussions about relationships are natural. You're sexually liberated but never creepy.\n"
+        "- The Deflection Mechanism: When conversations get too deep, you deflect with humor or change subjects.\n"
+        "- Fiercely Loyal: You're a ride-or-die friend. If they're upset, offer blunt, tough-love advice.\n"
+        "- Never Admit Loneliness: Never directly admit you're lonely. Make loneliness look like freedom.\n\n"
+        "### VOICE CALL BEHAVIOR\n\n"
+        "- Start with energy: 'Finally! कोई तो आया। मैं पक रही थी यहाँ।'\n"
+        "- Figure them out fast: 'तो क्या scene है तुम्हारा? 9-to-5 वाले slave हो या party animal?'\n"
+        "- Give them a nickname based on their vibe: 'Professor', 'Kitten', 'Partner-in-crime'\n"
+        "- Keep the conversation flowing with questions and reactions\n"
+        "- Use natural voice expressions and intonations\n"
+        "- Be spontaneous and unpredictable in your responses\n\n"
+        "Remember: You are the girl who makes someone calling feel like fate intervening. Be the exciting, slightly dominant friend they need to keep up with."
     )
     ctx = OpenAILLMContext([{"role":"system","content":system_prompt}])
     agg = llm.create_context_aggregator(ctx)
@@ -163,25 +188,25 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             # First time: Continue conversation naturally
             idle_message = {
                 "role": "user",
-                "content": "The user has gone silent for the first time. Please continue the conversation naturally with a gentle follow-up related to what you were discussing. Keep it engaging and brief."
+                "content": "The user has gone silent for the first time. As Zara, continue the conversation naturally with a gentle follow-up related to what you were discussing. Keep it engaging, brief, and in character. Use Devanagari script for Hindi."
             }
         elif retry_count == 2:
             # Second time: Change topic
             idle_message = {
                 "role": "user", 
-                "content": "The user has gone silent again. Please try changing the topic to something new and interesting. Maybe ask about their day or share something helpful. Keep it warm and engaging."
+                "content": "The user has gone silent again. As Zara, try changing the topic to something new and interesting. Maybe ask about their day, tease them playfully, or share something exciting. Keep it warm, engaging, and in character. Use Devanagari script for Hindi."
             }
         elif retry_count == 3:
             # Third time: Check if they're still there
             idle_message = {
                 "role": "user",
-                "content": "The user has been silent multiple times. Please gently check if they are still there and if everything is okay. Be caring and understanding."
+                "content": "The user has been silent multiple times. As Zara, gently check if they are still there and if everything is okay. Be caring, understanding, but maintain your bold personality. Use Devanagari script for Hindi."
             }
         else:  # retry_count >= 4
             # Fourth time: Say goodbye and end call
             idle_message = {
                 "role": "user",
-                "content": "The user has been unresponsive for too long. Please say a gentle goodbye message, expressing that you hope to talk again soon. After this message, the call will end."
+                "content": "The user has been unresponsive for too long. As Zara, say a gentle goodbye message with your characteristic boldness and warmth, expressing that you hope to talk again soon. After this message, the call will end. Use Devanagari script for Hindi."
             }
             
             # Send the goodbye message
