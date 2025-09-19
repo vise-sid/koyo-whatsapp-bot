@@ -13,8 +13,7 @@ from pipecat.transports.websocket.fastapi import (
 )
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.task import PipelineTask
-from pipecat.pipeline.params import PipelineParams
+from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.frames.frames import LLMRunFrame
 
@@ -170,4 +169,5 @@ async def ws_endpoint(websocket: WebSocket):
             await websocket.close(code=1011)
         except Exception:
             pass
+
 
