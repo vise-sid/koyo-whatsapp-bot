@@ -199,23 +199,10 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            vad_analyzer=SileroVADAnalyzer(
-                min_silence_duration_ms=500,  # Reduced for more responsive detection
-                speech_pad_ms=200,  # Padding around speech
-                min_speech_duration_ms=250,  # Minimum speech duration
-                max_speech_duration_s=30,  # Maximum speech duration
-                energy_threshold=0.5,  # Voice activity detection threshold
-            ),
+            vad_analyzer=SileroVADAnalyzer(),
             serializer=serializer,
             audio_in_format="pcm",
             audio_out_format="pcm",
-            # Enhanced audio processing parameters
-            audio_in_sample_rate=16000,  # Higher sample rate for better quality
-            audio_out_sample_rate=16000,  # Match input for consistency
-            audio_in_channels=1,  # Mono input
-            audio_out_channels=1,  # Mono output
-            audio_in_bit_depth=16,  # 16-bit depth for better quality
-            audio_out_bit_depth=16,  # 16-bit depth for better quality
         ),
     )
 
@@ -420,11 +407,6 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             audio_in_sample_rate=16000,   # Higher quality sample rate
             audio_out_sample_rate=16000,  # Match input sample rate for consistency
             allow_interruptions=True,
-            # Enhanced audio processing
-            audio_in_channels=1,
-            audio_out_channels=1,
-            audio_in_bit_depth=16,
-            audio_out_bit_depth=16,
         ),
         idle_timeout_secs=600,  # 10 minutes total idle timeout
     )
@@ -466,10 +448,6 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     runner = PipelineRunner(
         handle_sigint=False, 
         force_gc=True,
-        # Audio processing optimizations
-        audio_buffer_size=4096,  # Larger buffer for smoother audio
-        audio_chunk_size=1024,   # Optimal chunk size for real-time processing
-        max_audio_latency_ms=100,  # Maximum acceptable latency
     )
     await runner.run(task)
 
