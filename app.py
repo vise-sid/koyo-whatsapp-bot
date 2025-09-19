@@ -1,3 +1,4 @@
+import asyncio
 import os, json, logging
 from typing import Optional
 from urllib.parse import parse_qs
@@ -15,12 +16,13 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.pipeline.runner import PipelineRunner
-from pipecat.frames.frames import LLMRunFrame
-
-from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.frames.frames import LLMRunFrame, EndFrame, LLMMessagesAppendFrame
+from pipecat.processors.user_idle_processor import UserIdleProcessor
+from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.transcriptions.language import Language
 
 logger = logging.getLogger("uvicorn.error")
 app = FastAPI(title="Pipecat x Twilio WhatsApp Calling")
@@ -108,9 +110,30 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     )
 
     # Services
-    stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY, interim_results=True, model="nova-2-general")
+    stt = DeepgramSTTService(
+        api_key=DEEPGRAM_API_KEY,
+        live_options=LiveOptions(
+            model="nova-3-general",
+            language="multi",
+            smart_format=True,
+            interim_results=True,
+        )
+    )
     llm = OpenAILLMService(api_key=OPENAI_API_KEY, model="gpt-4o-mini")
-    tts = ElevenLabsTTSService(api_key=ELEVENLABS_API_KEY, voice_id=ELEVENLABS_VOICE_ID)
+    tts = ElevenLabsTTSService(
+        api_key=ELEVENLABS_API_KEY,
+        voice_id=ELEVENLABS_VOICE_ID,
+        model="eleven_flash_v2_5",
+        input_params=ElevenLabsTTSService.InputParams(
+            language=Language.EN,  # Can be changed to Language.HI for Hindi
+            stability=0.5,
+            similarity_boost=0.8,
+            style=0.5,
+            use_speaker_boost=False,
+            speed=0.85,
+            auto_mode=True
+        )
+    )
 
     system_prompt = (
         "You are a friendly, concise WhatsApp call assistant. "
@@ -119,9 +142,98 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     ctx = OpenAILLMContext([{"role":"system","content":system_prompt}])
     agg = llm.create_context_aggregator(ctx)
 
+    # Timeout handling system
+    def get_timeout_for_retry(retry_count: int) -> float:
+        """Return timeout value based on retry count"""
+        timeout_values = [15.0, 8.0, 4.0, 3.0]
+        return timeout_values[min(retry_count - 1, len(timeout_values) - 1)]
+
+    async def handle_user_idle_with_retry(user_idle: UserIdleProcessor, retry_count: int) -> bool:
+        """
+        Handle user idle with structured follow-up based on retry count.
+        Returns True to continue monitoring, False to stop.
+        """
+        logger.info(f"User idle - attempt #{retry_count}")
+        
+        # Update timeout for next retry
+        next_timeout = get_timeout_for_retry(retry_count + 1)
+        user_idle._timeout = next_timeout
+        
+        if retry_count == 1:
+            # First time: Continue conversation naturally
+            idle_message = {
+                "role": "user",
+                "content": "The user has gone silent for the first time. Please continue the conversation naturally with a gentle follow-up related to what you were discussing. Keep it engaging and brief."
+            }
+        elif retry_count == 2:
+            # Second time: Change topic
+            idle_message = {
+                "role": "user", 
+                "content": "The user has gone silent again. Please try changing the topic to something new and interesting. Maybe ask about their day or share something helpful. Keep it warm and engaging."
+            }
+        elif retry_count == 3:
+            # Third time: Check if they're still there
+            idle_message = {
+                "role": "user",
+                "content": "The user has been silent multiple times. Please gently check if they are still there and if everything is okay. Be caring and understanding."
+            }
+        else:  # retry_count >= 4
+            # Fourth time: Say goodbye and end call
+            idle_message = {
+                "role": "user",
+                "content": "The user has been unresponsive for too long. Please say a gentle goodbye message, expressing that you hope to talk again soon. After this message, the call will end."
+            }
+            
+            # Send the goodbye message
+            messages_for_llm = LLMMessagesAppendFrame([idle_message])
+            await task.queue_frames([messages_for_llm, LLMRunFrame()])
+            
+            # Schedule call termination after goodbye message
+            logger.info("Maximum idle attempts reached. Terminating call after goodbye message.")
+            asyncio.create_task(terminate_call_after_goodbye())
+            
+            # Return False to stop idle monitoring
+            return False
+        
+        # Send the appropriate message to LLM
+        messages_for_llm = LLMMessagesAppendFrame([idle_message])
+        await task.queue_frames([messages_for_llm, LLMRunFrame()])
+        
+        # Return True to continue monitoring for more idle events
+        return True
+
+    async def terminate_call_after_goodbye():
+        """Terminate the call after giving time for goodbye message to be spoken"""
+        logger.info("Terminating call due to user inactivity")
+        await task.queue_frames([EndFrame()])
+        
+        # Wait for the bot to finish speaking before ending
+        max_wait_time = 20  # Maximum 20 seconds
+        wait_time = 0
+        while wait_time < max_wait_time:
+            # Check if bot is still speaking
+            if hasattr(transport, '_bot_speaking') and not transport._bot_speaking:
+                logger.info("Bot finished speaking, proceeding to end call")
+                break
+            await asyncio.sleep(0.5)
+            wait_time += 0.5
+        
+        # Additional small delay to ensure audio finishes
+        await asyncio.sleep(2)
+        
+        # Clean up transport
+        await transport.cleanup()
+
+    # Use the retry callback pattern - UserIdleProcessor handles reset automatically
+    user_idle = UserIdleProcessor(
+        callback=handle_user_idle_with_retry,  # Uses retry callback signature
+        timeout=get_timeout_for_retry(1)  # Start with first timeout value (15.0)
+    )
+
     pipeline = Pipeline([
         transport.input(),     # caller audio -> PCM via serializer
         stt,                   # speech -> text
+        user_idle,             # UserIdleProcessor automatically resets on UserStartedSpeakingFrame
         agg.user(),            # add user text to context
         llm,                   # text -> text
         tts,                   # text -> speech
@@ -136,6 +248,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             audio_out_sample_rate=8000,  # Match input sample rate for Twilio
             allow_interruptions=True,
         ),
+        idle_timeout_secs=600,  # 10 minutes total idle timeout
     )
 
     @transport.event_handler("on_client_connected")
