@@ -377,9 +377,9 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     llm = OpenAILLMService(
         api_key=OPENAI_API_KEY, 
         model="gpt-5-2025-08-07",
-        params=OpenAILLMService.InputParams(
-            temperature=0.7,
-        )
+        # params=OpenAILLMService.InputParams(
+        #     temperature=0.7,
+        # )
     )
     
     # Register WhatsApp function handler
