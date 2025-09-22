@@ -30,6 +30,7 @@ from pipecat.transcriptions.language import Language
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams
+from openai import OpenAI
 
 logger = logging.getLogger("uvicorn.error")
 app = FastAPI(title="Pipecat x Twilio WhatsApp Calling")
@@ -37,6 +38,7 @@ app = FastAPI(title="Pipecat x Twilio WhatsApp Calling")
 # Global storage for caller information (in production, use Redis or database)
 caller_info_storage = {}
 active_sessions = {}
+offcall_context: Dict[str, list] = {}
 
 async def cleanup_old_caller_info():
     """Periodically clean up old caller info entries"""
@@ -136,6 +138,29 @@ class WhatsAppMessagingService:
                 "message": message,
                 "template_used": False
             }
+
+    async def send_freeform_message(self, to_number: str, message: str) -> Dict[str, Any]:
+        """Send a freeform WhatsApp message (no template/content sid).
+
+        Note: For inbound user-initiated sessions within the 24-hour window, freeform messages are allowed.
+        """
+        try:
+            if not to_number.startswith("whatsapp:"):
+                to_number = f"whatsapp:{to_number}"
+            from_number = self.from_number
+            if not from_number.startswith("whatsapp:"):
+                from_number = f"whatsapp:{from_number}"
+
+            message_obj = self.client.messages.create(
+                from_=from_number,
+                to=to_number,
+                body=message,
+            )
+            self.logger.info(f"WhatsApp freeform message sent - SID: {message_obj.sid}, To: {to_number}")
+            return {"success": True, "message_sid": message_obj.sid, "status": message_obj.status}
+        except Exception as e:
+            self.logger.error(f"Failed to send freeform WhatsApp message to {to_number}: {str(e)}")
+            return {"success": False, "error": str(e)}
 
 def get_current_time_context():
     """Get current time and date information for Mumbai timezone"""
@@ -251,7 +276,7 @@ async def whatsapp_webhook(request: Request):
             await session["task"].queue_frames(frames)
             return PlainTextResponse("OK", status_code=200)
 
-        # No live session -> off-call multimodal handling and reply over WhatsApp
+        # No live session -> off-call LLM chat with context and reply over WhatsApp (freeform)
         reply_text = await handle_multimodal_offcall(text_body, media_items, from_num)
 
         whatsapp_service = WhatsAppMessagingService(
@@ -259,7 +284,7 @@ async def whatsapp_webhook(request: Request):
             auth_token=TWILIO_AUTH_TOKEN,
             from_number=TWILIO_WHATSAPP_FROM,
         )
-        await whatsapp_service.send_message(to_number=from_num, message=reply_text, recipient_name="Friend")
+        await whatsapp_service.send_freeform_message(to_number=from_num, message=reply_text)
         return PlainTextResponse("OK", status_code=200)
 
     except Exception as e:
@@ -267,37 +292,70 @@ async def whatsapp_webhook(request: Request):
         return PlainTextResponse("Error", status_code=500)
 
 async def handle_multimodal_offcall(text: str, media: list, user_phone: str) -> str:
-    """Very lightweight off-call handler that normalizes inputs and returns a concise Meher-style reply.
+    """Off-call handler: build/maintain chat context and generate a Meher-style reply via LLM.
 
-    Note: Keep replies short (<= ~75 tokens) and in Hinglish with Devanagari for Hindi parts.
+    - Maintains per-user message history in offcall_context[user_phone]
+    - Supports text + media summaries
+    - Generates a concise Hinglish reply (≤ ~75 tokens)
     """
+    # 1) Build user turn with media summary
     parts = []
-    if text:
-        parts.append(f"Text: {text.strip()}")
+    if text and text.strip():
+        parts.append(text.strip())
+    media_summaries = []
     for m in media or []:
         ctype = (m.get("content_type") or "").lower()
         url = m.get("url")
         if not url:
             continue
         if "image/" in ctype:
-            parts.append("Image received")
+            media_summaries.append("[image]")
         elif "audio/" in ctype:
-            parts.append("Audio note received")
+            media_summaries.append("[audio note]")
         elif "application/" in ctype or "text/" in ctype:
-            parts.append("Document received")
+            media_summaries.append("[document]")
         else:
-            parts.append("Media received")
+            media_summaries.append("[media]")
+    if media_summaries:
+        parts.append(" ".join(media_summaries))
+    user_text = (" ".join(parts)).strip() or "[empty message]"
 
-    # Rule-based concise response to avoid external LLM here (can swap to LLM later)
-    if any("Audio" in p for p in parts):
-        return "सुना मैंने, boss — voice note मिला. एक छोटा सा point बताओ, मैं तुरंत reply कर दूँगी।"
-    if any("Image" in p for p in parts):
-        return "अच्छा — image मिली. context दो न, किस चीज़ पे help चाहिए?"
-    if any("Document" in p for p in parts):
-        return "डॉक्यूमेंट मिला — main points बताओ, मैं crisp plan बना दूँगी।"
-    if text and len(text.strip()) > 0:
-        return "मैं समझ गयी, boss. एक छोटा next step: 2-min का brain dump कर दो, फिर मैं structure दे दूँगी।"
-    return "मैं यहाँ हूँ — scene बताओ. मैं help कर दूँगी quick में।"
+    # 2) Prepare context store for user
+    history = offcall_context.get(user_phone) or []
+
+    # 3) System prompt for off-call chat (Meher rules, concise)
+    system_text = (
+        "You are Meher, a fiercely loyal and brutally honest friend. Speak in Hinglish with Devanagari for Hindi. "
+        "Keep replies ≤ 75 tokens, one purpose (validate | ask | nudge | suggest). Use female Hindi verb forms."
+    )
+
+    # 4) Build messages array (bounded history)
+    messages = [{"role": "system", "content": system_text}]
+    # include last ~8 messages from history for context
+    for m in history[-8:]:
+        messages.append(m)
+    messages.append({"role": "user", "content": user_text})
+
+    # 5) Call OpenAI for a short response
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=120,
+            temperature=0.7,
+        )
+        reply = (resp.choices[0].message.content or "")[:800]
+    except Exception as e:
+        logger.error(f"Off-call LLM error: {e}")
+        reply = "मैं समझ गयी, boss. One tiny step: 2-min का brain dump कर दो, फिर मैं structure दे दूँगी।"
+
+    # 6) Update history
+    history.append({"role": "user", "content": user_text})
+    history.append({"role": "assistant", "content": reply})
+    offcall_context[user_phone] = history[-20:]  # cap to last 20 turns
+
+    return reply
 
 # ---- Twilio webhook (TwiML App Voice Request URL) ----
 @app.post("/voice")
