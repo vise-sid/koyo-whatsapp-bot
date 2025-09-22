@@ -162,6 +162,56 @@ class WhatsAppMessagingService:
             self.logger.error(f"Failed to send freeform WhatsApp message to {to_number}: {str(e)}")
             return {"success": False, "error": str(e)}
 
+async def _fetch_with_twilio_auth(url: str) -> bytes:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+        r.raise_for_status()
+        return r.content
+
+async def _transcribe_twilio_audio(url: str) -> str:
+    try:
+        audio_bytes = await _fetch_with_twilio_auth(url)
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        # OpenAI whisper transcription
+        from io import BytesIO
+        file_like = BytesIO(audio_bytes)
+        file_like.name = "audio.ogg"
+        tr = client.audio.transcriptions.create(model="whisper-1", file=file_like)
+        return (tr.text or "").strip()
+    except Exception as e:
+        logger.error(f"Audio transcription failed: {e}")
+        return ""
+
+async def _caption_image_url(image_url: str) -> str:
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        prompt = "Caption the image in one short casual line and infer the likely intent if obvious."
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ]}
+            ],
+            max_tokens=80,
+            temperature=0.7,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.error(f"Image captioning failed: {e}")
+        return ""
+
+async def _fetch_text_excerpt(url: str, max_chars: int = 800) -> str:
+    try:
+        data = await _fetch_with_twilio_auth(url)
+        text = data.decode("utf-8", errors="ignore")
+        text = " ".join(text.split())
+        return text[:max_chars]
+    except Exception as e:
+        logger.error(f"Text fetch failed: {e}")
+        return ""
+
 def get_current_time_context():
     """Get current time and date information for Mumbai timezone"""
     mumbai_tz = pytz.timezone('Asia/Kolkata')
@@ -264,18 +314,40 @@ async def whatsapp_webhook(request: Request):
         session = active_sessions.get(from_num)
 
         if session:
-            # Inject into ongoing call context
-            summary = text_body.strip() if text_body else "[Media received]"
-            if media_items:
-                media_list = ", ".join([m["url"] for m in media_items])
-                summary = f"{summary} | Media: {media_list}"
+            # Inject into ongoing call context with media enrichment
+            parts = []
+            if text_body.strip():
+                parts.append(text_body.strip())
+            # Enrich media: transcribe audio, caption images, mark documents
+            for m in media_items or []:
+                ctype = (m.get("content_type") or "").lower()
+                url = m.get("url")
+                if not url:
+                    continue
+                try:
+                    if "audio/" in ctype:
+                        transcript = await _transcribe_twilio_audio(url)
+                        parts.append(f"[audio transcript] {transcript}" if transcript else "[audio note received]")
+                    elif "image/" in ctype:
+                        caption = await _caption_image_url(url)
+                        parts.append(f"[image] {caption}" if caption else "[image received]")
+                    elif "text/" in ctype:
+                        excerpt = await _fetch_text_excerpt(url, max_chars=500)
+                        parts.append(f"[text doc excerpt] {excerpt}" if excerpt else "[text document received]")
+                    elif "application/pdf" in ctype or ctype.startswith("application/"):
+                        parts.append("[document received]")
+                    else:
+                        parts.append("[media received]")
+                except Exception as me:
+                    logger.error(f"Media handling error (in-call) for {url}: {me}")
+                    parts.append("[media received]")
 
+            content = (" ".join(parts)).strip() or "[empty message]"
             frames = [
-                LLMMessagesAppendFrame([{ "role": "user", "content": f"(WhatsApp) {summary}" }]),
+                LLMMessagesAppendFrame([{ "role": "user", "content": f"(WhatsApp) {content}" }]),
                 LLMRunFrame(),
             ]
             await session["task"].queue_frames(frames)
-            # Do not send any direct WhatsApp auto-reply; just return 204
             return Response(status_code=204)
 
         # No live session -> off-call LLM chat with context and reply over WhatsApp (freeform)
@@ -305,22 +377,29 @@ async def handle_multimodal_offcall(text: str, media: list, user_phone: str) -> 
     parts = []
     if text and text.strip():
         parts.append(text.strip())
-    media_summaries = []
+    # Enrich media for off-call: transcribe/caption/excerpt
     for m in media or []:
         ctype = (m.get("content_type") or "").lower()
         url = m.get("url")
         if not url:
             continue
-        if "image/" in ctype:
-            media_summaries.append("[image]")
-        elif "audio/" in ctype:
-            media_summaries.append("[audio note]")
-        elif "application/" in ctype or "text/" in ctype:
-            media_summaries.append("[document]")
-        else:
-            media_summaries.append("[media]")
-    if media_summaries:
-        parts.append(" ".join(media_summaries))
+        try:
+            if "audio/" in ctype:
+                transcript = await _transcribe_twilio_audio(url)
+                parts.append(f"[audio transcript] {transcript}" if transcript else "[audio note received]")
+            elif "image/" in ctype:
+                caption = await _caption_image_url(url)
+                parts.append(f"[image] {caption}" if caption else "[image received]")
+            elif "text/" in ctype:
+                excerpt = await _fetch_text_excerpt(url, max_chars=800)
+                parts.append(f"[text doc excerpt] {excerpt}" if excerpt else "[text document received]")
+            elif "application/pdf" in ctype or ctype.startswith("application/"):
+                parts.append("[document received]")
+            else:
+                parts.append("[media received]")
+        except Exception as me:
+            logger.error(f"Media handling error (off-call) for {url}: {me}")
+            parts.append("[media received]")
     user_text = (" ".join(parts)).strip() or "[empty message]"
 
     # 2) Prepare context store for user
