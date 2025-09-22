@@ -36,6 +36,7 @@ app = FastAPI(title="Pipecat x Twilio WhatsApp Calling")
 
 # Global storage for caller information (in production, use Redis or database)
 caller_info_storage = {}
+active_sessions = {}
 
 async def cleanup_old_caller_info():
     """Periodically clean up old caller info entries"""
@@ -174,76 +175,6 @@ def extract_phone_number(whatsapp_number: str) -> str:
 @app.get("/health")
 def health(): return {"ok": True}
 
-@app.post("/test-whatsapp")
-async def test_whatsapp_message(request: Request):
-    """Test endpoint to verify WhatsApp messaging functionality"""
-    try:
-        body = await request.json()
-        to_number = body.get("to_number")
-        message = body.get("message", "Test message from Koyo WhatsApp integration!")
-        
-        if not to_number:
-            return {"error": "to_number is required"}
-        
-        # Initialize WhatsApp service
-        whatsapp_service = WhatsAppMessagingService(
-            account_sid=TWILIO_ACCOUNT_SID,
-            auth_token=TWILIO_AUTH_TOKEN,
-            from_number=TWILIO_WHATSAPP_FROM
-        )
-        
-        # Send test message using template
-        result = await whatsapp_service.send_message(
-            to_number=to_number, 
-            message=message, 
-            recipient_name="Test User"
-        )
-        
-        return {
-            "success": result["success"],
-            "message": "WhatsApp message test completed",
-            "result": result
-        }
-        
-    except Exception as e:
-        logger.error(f"Test WhatsApp endpoint error: {str(e)}")
-        return {"error": str(e), "success": False}
-
-@app.get("/whatsapp-status")
-async def whatsapp_status():
-    """Check WhatsApp configuration status"""
-    try:
-        # Check if all required environment variables are set
-        config_status = {
-            "twilio_account_sid": bool(TWILIO_ACCOUNT_SID),
-            "twilio_auth_token": bool(TWILIO_AUTH_TOKEN),
-            "twilio_whatsapp_from": bool(TWILIO_WHATSAPP_FROM),
-            "whatsapp_from_number": TWILIO_WHATSAPP_FROM,
-            "whatsapp_template": "koyo_simple",
-            "template_sid": "HXe35b0e8a3ebf215e7407f5131ea03510"
-        }
-        
-        # Test Twilio client initialization
-        try:
-            client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-            # Try to get account info to verify credentials
-            account = client.api.accounts(TWILIO_ACCOUNT_SID).fetch()
-            config_status["twilio_connection"] = True
-            config_status["account_friendly_name"] = account.friendly_name
-        except Exception as e:
-            config_status["twilio_connection"] = False
-            config_status["twilio_error"] = str(e)
-        
-        return {
-            "success": True,
-            "config": config_status,
-            "message": "WhatsApp configuration status checked"
-        }
-        
-    except Exception as e:
-        logger.error(f"WhatsApp status check error: {str(e)}")
-        return {"error": str(e), "success": False}
-
 @app.on_event("startup")
 async def startup_event():
     """Start background tasks when the app starts"""
@@ -276,6 +207,97 @@ def _validate_twilio_http(request: Request, body: bytes) -> bool:
     except Exception:
         params = {}
     return validator.validate(url, params, sig)
+
+# ---- WhatsApp webhook (Messaging Inbound) ----
+@app.post("/whatsapp-webhook")
+async def whatsapp_webhook(request: Request):
+    """Handle inbound WhatsApp messages.
+
+    Behavior:
+    - If there's an active voice session for the sender, inject the text/media summary into the live LLM context
+    - Otherwise, run a lightweight off-call multimodal handler and reply via WhatsApp
+    """
+    body_bytes = await request.body()
+    if not _validate_twilio_http(request, body_bytes):
+        logger.warning("Twilio signature validation failed for WhatsApp webhook")
+        return Response(status_code=403)
+
+    try:
+        form = await request.form()
+        from_num = (form.get("From") or "").replace("whatsapp:", "")
+        text_body = form.get("Body", "") or ""
+        num_media = int(form.get("NumMedia", "0") or "0")
+
+        media_items = []
+        for i in range(num_media):
+            url = form.get(f"MediaUrl{i}")
+            ctype = form.get(f"MediaContentType{i}")
+            if url:
+                media_items.append({"url": url, "content_type": ctype or ""})
+
+        session = active_sessions.get(from_num)
+
+        if session:
+            # Inject into ongoing call context
+            summary = text_body.strip() if text_body else "[Media received]"
+            if media_items:
+                media_list = ", ".join([m["url"] for m in media_items])
+                summary = f"{summary} | Media: {media_list}"
+
+            frames = [
+                LLMMessagesAppendFrame([{ "role": "user", "content": f"(WhatsApp) {summary}" }]),
+                LLMRunFrame(),
+            ]
+            await session["task"].queue_frames(frames)
+            return PlainTextResponse("OK", status_code=200)
+
+        # No live session -> off-call multimodal handling and reply over WhatsApp
+        reply_text = await handle_multimodal_offcall(text_body, media_items, from_num)
+
+        whatsapp_service = WhatsAppMessagingService(
+            account_sid=TWILIO_ACCOUNT_SID,
+            auth_token=TWILIO_AUTH_TOKEN,
+            from_number=TWILIO_WHATSAPP_FROM,
+        )
+        await whatsapp_service.send_message(to_number=from_num, message=reply_text, recipient_name="Friend")
+        return PlainTextResponse("OK", status_code=200)
+
+    except Exception as e:
+        logger.exception("WhatsApp webhook error: %s", e)
+        return PlainTextResponse("Error", status_code=500)
+
+async def handle_multimodal_offcall(text: str, media: list, user_phone: str) -> str:
+    """Very lightweight off-call handler that normalizes inputs and returns a concise Meher-style reply.
+
+    Note: Keep replies short (<= ~75 tokens) and in Hinglish with Devanagari for Hindi parts.
+    """
+    parts = []
+    if text:
+        parts.append(f"Text: {text.strip()}")
+    for m in media or []:
+        ctype = (m.get("content_type") or "").lower()
+        url = m.get("url")
+        if not url:
+            continue
+        if "image/" in ctype:
+            parts.append("Image received")
+        elif "audio/" in ctype:
+            parts.append("Audio note received")
+        elif "application/" in ctype or "text/" in ctype:
+            parts.append("Document received")
+        else:
+            parts.append("Media received")
+
+    # Rule-based concise response to avoid external LLM here (can swap to LLM later)
+    if any("Audio" in p for p in parts):
+        return "सुना मैंने, boss — voice note मिला. एक छोटा सा point बताओ, मैं तुरंत reply कर दूँगी।"
+    if any("Image" in p for p in parts):
+        return "अच्छा — image मिली. context दो न, किस चीज़ पे help चाहिए?"
+    if any("Document" in p for p in parts):
+        return "डॉक्यूमेंट मिला — main points बताओ, मैं crisp plan बना दूँगी।"
+    if text and len(text.strip()) > 0:
+        return "मैं समझ गयी, boss. एक छोटा next step: 2-min का brain dump कर दो, फिर मैं structure दे दूँगी।"
+    return "मैं यहाँ हूँ — scene बताओ. मैं help कर दूँगी quick में।"
 
 # ---- Twilio webhook (TwiML App Voice Request URL) ----
 @app.post("/voice")
@@ -714,6 +736,19 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         idle_timeout_secs=600,  # 10 minutes total idle timeout
     )
 
+    # Register active session for this caller (enables WA->voice bridging)
+    try:
+        if caller_phone and caller_phone != "Unknown":
+            active_sessions[caller_phone] = {
+                "call_sid": call_sid,
+                "task": task,
+                "transport": transport,
+                "display_name": caller_display_name,
+            }
+            logger.info(f"Registered active session for {caller_phone}")
+    except Exception:
+        pass
+
     @transport.event_handler("on_client_connected")
     async def _greet(_t, _c):
         logger.info("Client connected, sending greeting...")
@@ -798,6 +833,15 @@ async def ws_endpoint(websocket: WebSocket):
         if 'call_sid' in locals() and call_sid and call_sid in caller_info_storage:
             del caller_info_storage[call_sid]
             logger.info(f"Cleaned up caller info on disconnect for CallSid: {call_sid}")
+        # Clean up active session
+        try:
+            if 'caller_number' in locals() and caller_number:
+                phone = extract_phone_number(caller_number)
+                if phone in active_sessions:
+                    del active_sessions[phone]
+                    logger.info(f"Deregistered active session for {phone}")
+        except Exception:
+            pass
     except Exception as e:
         logger.exception("WS error: %s", e)
         # Clean up stored caller info on error
