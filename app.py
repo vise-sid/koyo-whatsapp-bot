@@ -31,6 +31,12 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams
 from openai import OpenAI
+try:
+    from mem0 import Memory
+    from mem0.configs.llms.openai import OpenAILLMConfig
+    _MEM0_AVAILABLE = True
+except Exception:
+    _MEM0_AVAILABLE = False
 
 logger = logging.getLogger("uvicorn.error")
 app = FastAPI(title="Pipecat x Twilio WhatsApp Calling")
@@ -39,6 +45,7 @@ app = FastAPI(title="Pipecat x Twilio WhatsApp Calling")
 caller_info_storage = {}
 active_sessions = {}
 offcall_context: Dict[str, list] = {}
+mem0_client = None
 
 async def cleanup_old_caller_info():
     """Periodically clean up old caller info entries"""
@@ -187,14 +194,14 @@ async def _caption_image_url(image_url: str) -> str:
         client = OpenAI(api_key=OPENAI_API_KEY)
         prompt = "Caption the image in one short casual line and infer the likely intent if obvious."
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[
                 {"role": "user", "content": [
                     {"type": "text", "text": prompt},
                     {"type": "image_url", "image_url": {"url": image_url}},
                 ]}
             ],
-            max_tokens=80,
+            max_tokens=120,
             temperature=0.7,
         )
         return (resp.choices[0].message.content or "").strip()
@@ -255,6 +262,26 @@ async def startup_event():
     """Start background tasks when the app starts"""
     asyncio.create_task(cleanup_old_caller_info())
     logger.info("Started caller info cleanup task")
+    # Initialize Mem0 OSS if available
+    global mem0_client
+    if _MEM0_AVAILABLE and mem0_client is None:
+        try:
+            import os
+            mem0_client = Memory.from_config({
+                "llm": OpenAILLMConfig(
+                    model="gpt-4o",
+                    api_key=OPENAI_API_KEY,
+                ),
+                "vector_store": {
+                    "provider": "qdrant",
+                    "url": os.getenv("QDRANT_URL", ""),
+                    "api_key": os.getenv("QDRANT_API_KEY", ""),
+                    "collection": "mem0_koyo"
+                }
+            })
+            logger.info("Mem0 initialized (OSS + Qdrant)")
+        except Exception as e:
+            logger.error(f"Mem0 init failed: {e}")
 
 # ---- helpers ----
 def _ws_url(request: Request) -> str:
@@ -348,6 +375,16 @@ async def whatsapp_webhook(request: Request):
                 LLMRunFrame(),
             ]
             await session["task"].queue_frames(frames)
+            # Store inbound message as memory
+            try:
+                if _MEM0_AVAILABLE and mem0_client is not None and from_num:
+                    mem0_client.add(
+                        text=f"user_said: {content[:200]}",
+                        user_id=from_num,
+                        metadata={"tags":["whatsapp","voice","user"]}
+                    )
+            except Exception as me:
+                logger.error(f"Mem0 add (in-call WA) failed: {me}")
             return Response(status_code=204)
 
         # No live session -> off-call LLM chat with context and reply over WhatsApp (freeform)
@@ -491,7 +528,7 @@ async def handle_multimodal_offcall(text: str, media: list, user_phone: str) -> 
         """
     )
 
-    # 4) Build messages array (bounded history)
+    # 4) Build messages array (bounded history). Allow tool call for memory fetch.
     messages = [{"role": "system", "content": system_text}]
     # include last ~8 messages from history for context
     for m in history[-8:]:
@@ -501,12 +538,59 @@ async def handle_multimodal_offcall(text: str, media: list, user_phone: str) -> 
     # 5) Call OpenAI for a short response
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
+        tools = []
+        if _MEM0_AVAILABLE and mem0_client is not None:
+            tools = [{
+                "type": "function",
+                "function": {
+                    "name": "fetch_memories",
+                    "description": "Retrieve relevant memories for the current topic. Call only if needed.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"]
+                    }
+                }
+            }]
+
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=messages,
+            tools=tools if tools else None,
+            tool_choice="auto" if tools else None,
             max_tokens=120,
             temperature=0.7,
         )
+        msg = resp.choices[0].message
+        if tools and getattr(msg, "tool_calls", None):
+            import json
+            for call in msg.tool_calls:
+                if call.function.name == "fetch_memories":
+                    args = json.loads(call.function.arguments or "{}")
+                    query = args.get("query", user_text)
+                    try:
+                        res = mem0_client.search(query=query, user_id=user_phone, limit=5, threshold=0.35) or []
+                        hits = [r.get("memory") or r.get("text") or str(r) for r in res]
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "name": "fetch_memories",
+                            "content": "\n".join(hits) if hits else "NO_MEMORIES",
+                        })
+                    except Exception as me:
+                        logger.error(f"Mem0 search failed: {me}")
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "name": "fetch_memories",
+                            "content": "NO_MEMORIES",
+                        })
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                max_tokens=120,
+                temperature=0.7,
+            )
         reply = (resp.choices[0].message.content or "")[:800]
     except Exception as e:
         logger.error(f"Off-call LLM error: {e}")
@@ -516,6 +600,14 @@ async def handle_multimodal_offcall(text: str, media: list, user_phone: str) -> 
     history.append({"role": "user", "content": user_text})
     history.append({"role": "assistant", "content": reply})
     offcall_context[user_phone] = history[-20:]  # cap to last 20 turns
+
+    # 7) Store salient memory (non-blocking best-effort)
+    try:
+        if _MEM0_AVAILABLE and mem0_client is not None:
+            mem0_client.add(text=f"user_said: {user_text[:200]}", user_id=user_phone, metadata={"tags":["whatsapp","user"]})
+            mem0_client.add(text=f"assistant_hint: {reply[:200]}", user_id=user_phone, metadata={"tags":["whatsapp","assistant"]})
+    except Exception as me:
+        logger.error(f"Mem0 add failed: {me}")
 
     return reply
 
@@ -612,8 +704,19 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         required=["message"]
     )
     
-    # Create tools schema
-    tools = ToolsSchema(standard_tools=[whatsapp_function])
+    # Optional: memory fetch function (LLM calls only when needed)
+    if _MEM0_AVAILABLE and mem0_client is not None:
+        fetch_memories_function = FunctionSchema(
+            name="fetch_memories",
+            description="Retrieve relevant user memories for current topic. Call only if helpful.",
+            properties={
+                "query": {"type":"string","description":"What to search in the user's memories."}
+            },
+            required=["query"]
+        )
+        tools = ToolsSchema(standard_tools=[whatsapp_function, fetch_memories_function])
+    else:
+        tools = ToolsSchema(standard_tools=[whatsapp_function])
     
     # Initialize LLM service
     llm = OpenAILLMService(
@@ -665,6 +768,20 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     
     # Register the function handler with the LLM service
     llm.register_function("send_whatsapp_message", send_whatsapp_message_handler)
+
+    # Register memory fetch handler if available
+    if _MEM0_AVAILABLE and mem0_client is not None:
+        async def fetch_memories_handler(params: FunctionCallParams):
+            try:
+                query = params.arguments.get("query", "") or ""
+                res = mem0_client.search(query=query, user_id=caller_phone, limit=5, threshold=0.35) or []
+                hits = [r.get("memory") or r.get("text") or str(r) for r in res]
+                await params.result_callback("\n".join(hits) if hits else "NO_MEMORIES")
+            except Exception as me:
+                logger.error(f"fetch_memories error: {me}")
+                await params.result_callback("NO_MEMORIES")
+
+        llm.register_function("fetch_memories", fetch_memories_handler)
     tts = ElevenLabsTTSService(
         api_key=ELEVENLABS_API_KEY,
         voice_id=ELEVENLABS_VOICE_ID,
