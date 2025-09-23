@@ -20,3 +20,11 @@ services:
         value: Rachel
       - key: VALIDATE_TWILIO_SIGNATURE
         value: "true"
+      - key: TWILIO_WHATSAPP_FROM
+        sync: false
+      - key: MEM0_VECTOR_BACKEND
+        value: qdrant
+      - key: QDRANT_URL
+        sync: false
+      - key: QDRANT_API_KEY
+        sync: false
