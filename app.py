@@ -31,7 +31,7 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams
 from openai import OpenAI
-from pipecat.services.mem0 import Mem0MemoryService
+from pipecat.services.mem0.memory import Mem0MemoryService
 from prompts.meher_voice_prompt import get_voice_system_prompt
 from prompts.meher_text_prompt import get_text_system_prompt
 try:
