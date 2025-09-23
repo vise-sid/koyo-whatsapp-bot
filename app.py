@@ -36,7 +36,7 @@ from prompts.meher_voice_prompt import get_voice_system_prompt
 from prompts.meher_text_prompt import get_text_system_prompt
 try:
     # Mem0 platform SDK
-    from mem0 import Mem0Client
+    from mem0 importMemoryClient
     _MEM0_AVAILABLE = True
 except Exception:
     _MEM0_AVAILABLE = False
@@ -379,7 +379,7 @@ async def startup_event():
     global mem0_client
     if _MEM0_AVAILABLE and mem0_client is None:
         try:
-            mem0_client = Mem0Client(api_key=os.getenv("MEM0_API_KEY", ""))
+            mem0_client =MemoryClient(api_key=os.getenv("MEM0_API_KEY", ""))
             logger.info("Mem0 initialized (Platform)")
         except Exception as e:
             logger.error(f"Mem0 init failed: {e}")
