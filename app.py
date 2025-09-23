@@ -36,7 +36,7 @@ from prompts.meher_voice_prompt import get_voice_system_prompt
 from prompts.meher_text_prompt import get_text_system_prompt
 try:
     # Mem0 platform SDK
-    from mem0 importMemoryClient
+    from mem0 import MemoryClient
     _MEM0_AVAILABLE = True
 except Exception:
     _MEM0_AVAILABLE = False
