@@ -7,7 +7,7 @@ import pytz
 import httpx
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import PlainTextResponse, Response, HTMLResponse, JSONResponse
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client
 
@@ -256,6 +256,90 @@ def extract_phone_number(whatsapp_number: str) -> str:
 
 @app.get("/health")
 def health(): return {"ok": True}
+
+# ---- Admin/Dashboard: Inspect memories and conversation snippets ----
+@app.get("/memories/{user_id}")
+async def get_user_memories(user_id: str, limit: int = 20, threshold: float = 0.0):
+    if not _MEM0_AVAILABLE or mem0_client is None:
+        return JSONResponse({"success": False, "error": "Mem0 not initialized"}, status_code=500)
+    try:
+        # broad search to list latest/top vectors – if OSS returns empty on empty query, use a wildcard phrase
+        query = "recent user memories"
+        res = mem0_client.search(query=query, user_id=user_id, limit=limit, threshold=threshold) or []
+        items = []
+        for r in res:
+            text = r.get("memory") or r.get("text") or str(r)
+            score = r.get("score")
+            meta = r.get("metadata") or {}
+            items.append({"text": text, "score": score, "metadata": meta})
+        return {"success": True, "user_id": user_id, "count": len(items), "items": items}
+    except Exception as e:
+        logger.error(f"Mem0 list error: {e}")
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+@app.get("/memories/search")
+async def search_user_memories(user_id: str, query: str, limit: int = 10, threshold: float = 0.35):
+    if not _MEM0_AVAILABLE or mem0_client is None:
+        return JSONResponse({"success": False, "error": "Mem0 not initialized"}, status_code=500)
+    try:
+        res = mem0_client.search(query=query, user_id=user_id, limit=limit, threshold=threshold) or []
+        items = []
+        for r in res:
+            text = r.get("memory") or r.get("text") or str(r)
+            score = r.get("score")
+            meta = r.get("metadata") or {}
+            items.append({"text": text, "score": score, "metadata": meta})
+        return {"success": True, "user_id": user_id, "query": query, "count": len(items), "items": items}
+    except Exception as e:
+        logger.error(f"Mem0 search error: {e}")
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+@app.get("/memories/dashboard")
+async def memories_dashboard(user_id: str = "", query: str = "", limit: int = 10, threshold: float = 0.35):
+    if not _MEM0_AVAILABLE or mem0_client is None:
+        return HTMLResponse("<h3>Mem0 not initialized</h3>")
+    html_head = """
+    <style>
+      body{font-family:Inter,system-ui,Arial;padding:24px;max-width:900px;margin:0 auto}
+      h1{font-size:22px;margin:0 0 12px}
+      form{margin:16px 0;padding:12px;border:1px solid #eee;border-radius:8px}
+      input,button{padding:8px 10px;margin:4px}
+      .item{padding:10px;border-bottom:1px solid #eee}
+      .meta{color:#666;font-size:12px}
+      code{background:#f6f8fa;padding:2px 4px;border-radius:4px}
+    </style>
+    """
+    items_html = ""
+    count = 0
+    if user_id:
+        try:
+            q = query or "recent user memories"
+            res = mem0_client.search(query=q, user_id=user_id, limit=limit, threshold=threshold) or []
+            for r in res:
+                text = (r.get("memory") or r.get("text") or str(r)).replace("<", "&lt;")
+                score = r.get("score")
+                meta = r.get("metadata") or {}
+                items_html += f"<div class='item'><div>{text}</div><div class='meta'>score={score} | metadata={meta}</div></div>"
+            count = len(res)
+        except Exception as e:
+            items_html = f"<div class='item'>Error: {str(e)}</div>"
+    form_html = f"""
+      <h1>Memories Dashboard</h1>
+      <form method='get'>
+        <label>User ID (phone):</label>
+        <input name='user_id' value='{user_id}' placeholder='e.g. +15551234567' />
+        <label>Query:</label>
+        <input name='query' value='{query}' placeholder='topic or keyword' />
+        <label>Limit:</label>
+        <input name='limit' type='number' min='1' max='100' value='{limit}' />
+        <label>Threshold:</label>
+        <input name='threshold' type='number' step='0.01' value='{threshold}' />
+        <button type='submit'>Search</button>
+      </form>
+      <div><b>Results:</b> {count}</div>
+      <div>{items_html}</div>
+    """
+    return HTMLResponse(html_head + form_html)
 
 @app.on_event("startup")
 async def startup_event():
