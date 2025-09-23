@@ -22,9 +22,5 @@ services:
         value: "true"
       - key: TWILIO_WHATSAPP_FROM
         sync: false
-      - key: MEM0_VECTOR_BACKEND
-        value: qdrant
-      - key: QDRANT_URL
-        sync: false
-      - key: QDRANT_API_KEY
+      - key: MEM0_API_KEY
         sync: false
