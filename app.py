@@ -50,7 +50,7 @@ active_sessions = {}
 offcall_context: Dict[str, list] = {}
 mem0_client = None
 
-# ---- Mem0 Platform compatibility helpers (handle API name differences) ----
+# ---- Mem0 Platform helpers ----
 def _mem_platform_search(user_id: str, query: str, top_k: int = 5, score_threshold: float = 0.35) -> list:
     if not _MEM0_AVAILABLE or mem0_client is None:
         return []
@@ -63,16 +63,25 @@ def _mem_platform_search(user_id: str, query: str, top_k: int = 5, score_thresho
         logger.error(f"Mem0 search error: {e}")
     return []
 
-def _mem_platform_add(user_id: str, text: str, metadata: dict | None = None) -> None:
+def _mem_platform_add_messages(user_id: str, messages: list[dict], run_id: str | None = None) -> None:
     if not _MEM0_AVAILABLE or mem0_client is None:
         return
     try:
-        if hasattr(mem0_client, "add_memory"):
-            mem0_client.add_memory(user_id=user_id, memory=text, metadata=metadata or {})
-            return
+        # Preferred contextual add per platform docs
         if hasattr(mem0_client, "add"):
-            mem0_client.add(user_id=user_id, memory=text, metadata=metadata or {})
+            kwargs = {"messages": messages, "user_id": user_id, "version": "v2"}
+            if run_id:
+                kwargs["run_id"] = run_id
+            mem0_client.add(**kwargs)
             return
+        # Fallback: if only add_memory exists, store each message minimally
+        if hasattr(mem0_client, "add_memory"):
+            for m in messages:
+                if not m.get("content"):
+                    continue
+                mem0_client.add_memory(user_id=user_id, memory=m["content"], metadata={"role": m.get("role")})
+            return
+        logger.warning("Mem0 client has neither add nor add_memory; skipping memory write")
     except Exception as e:
         logger.error(f"Mem0 add error: {e}")
 
@@ -476,10 +485,16 @@ async def whatsapp_webhook(request: Request):
                 LLMRunFrame(),
             ]
             await session["task"].queue_frames(frames)
-            # Store inbound message as memory
+            # Store inbound message as contextual messages
             try:
                 if _MEM0_AVAILABLE and mem0_client is not None and from_num:
-                    _mem_platform_add(user_id=from_num, text=f"user_said: {content[:200]}", metadata={"tags":["whatsapp","voice","user"]})
+                    _mem_platform_add_messages(
+                        user_id=from_num,
+                        messages=[
+                            {"role": "user", "content": content[:500]}
+                        ],
+                        run_id=session.get("call_sid") if isinstance(session, dict) else None,
+                    )
             except Exception as me:
                 logger.error(f"Mem0 add (in-call WA) failed: {me}")
             return Response(status_code=204)
@@ -620,11 +635,16 @@ async def handle_multimodal_offcall(text: str, media: list, user_phone: str) -> 
     history.append({"role": "assistant", "content": reply})
     offcall_context[user_phone] = history[-20:]  # cap to last 20 turns
 
-    # 7) Store salient memory (non-blocking best-effort)
+    # 7) Store contextual messages (non-blocking best-effort)
     try:
         if _MEM0_AVAILABLE and mem0_client is not None:
-            _mem_platform_add(user_id=user_phone, text=f"user_said: {user_text[:200]}", metadata={"tags":["whatsapp","user"]})
-            _mem_platform_add(user_id=user_phone, text=f"assistant_hint: {reply[:200]}", metadata={"tags":["whatsapp","assistant"]})
+            _mem_platform_add_messages(
+                user_id=user_phone,
+                messages=[
+                    {"role": "user", "content": user_text[:500]},
+                    {"role": "assistant", "content": reply[:500]},
+                ],
+            )
     except Exception as me:
         logger.error(f"Mem0 add failed: {me}")
 
