@@ -31,7 +31,7 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams
 from openai import OpenAI
-from pipecat.services.mem0.memory import Mem0MemoryService
+from pipecat.services.mem0 import Mem0MemoryService
 from prompts.meher_voice_prompt import get_voice_system_prompt
 from prompts.meher_text_prompt import get_text_system_prompt
 try:
@@ -813,8 +813,8 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         async def fetch_memories_handler(params: FunctionCallParams):
             try:
                 query = params.arguments.get("query", "") or ""
-                res = mem0_client.search(query=query, user_id=caller_phone, limit=5, threshold=0.35) or []
-                hits = [r.get("memory") or r.get("text") or str(r) for r in res]
+                res = _mem_platform_search(user_id=caller_phone, query=query, top_k=5, score_threshold=0.35)
+                hits = [r.get("text") or r.get("memory") or str(r) for r in res]
                 await params.result_callback("\n".join(hits) if hits else "NO_MEMORIES")
             except Exception as me:
                 logger.error(f"fetch_memories error: {me}")
@@ -964,17 +964,10 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         try:
             memory_service = Mem0MemoryService(
                 api_key=os.getenv("MEM0_API_KEY"),
-                user_id=caller_phone or "unknown",
-                agent_id="meher",
-                run_id=call_sid or "voice",
-                params={
-                    "search_limit": 5,
-                    "search_threshold": 0.35,
-                    "system_prompt": "[MEMORY CONTEXT] Use only if relevant:\n",
-                    "add_as_system_message": True,
-                    "position": 0,
-                },
+                user_id=caller_phone if caller_phone and caller_phone != "Unknown" else (caller_name or "unknown"),
+                agent_id="meher"
             )
+            logger.info(f"Mem0MemoryService attached: user_id={caller_phone}")
         except Exception as e:
             logger.error(f"Mem0MemoryService init failed: {e}")
             memory_service = None
