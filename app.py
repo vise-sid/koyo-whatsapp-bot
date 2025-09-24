@@ -578,10 +578,10 @@ async def handle_multimodal_offcall(text: str, media: list, user_phone: str) -> 
                 "type": "function",
                 "function": {
                     "name": "fetch_memories",
-                    "description": "Retrieve relevant memories for the current topic. Call only if needed.",
+                    "description": "Retrieve relevant user memories ONLY when the user explicitly mentions something from the past, asks about previous conversations, or references something specific that might be in memory. Do NOT call this for general conversation.",
                     "parameters": {
                         "type": "object",
-                        "properties": {"query": {"type": "string"}},
+                        "properties": {"query": {"type": "string", "description": "Specific topic, person, event, or detail to search for in past conversations."}},
                         "required": ["query"]
                     }
                 }
@@ -603,8 +603,13 @@ async def handle_multimodal_offcall(text: str, media: list, user_phone: str) -> 
                     args = json.loads(call.function.arguments or "{}")
                     query = args.get("query", user_text)
                     try:
-                        res = _mem_platform_search(user_id=user_phone, query=query, top_k=5, score_threshold=0.35)
+                        logger.info(f"Off-call memory search for query: '{query}'")
+                        res = _mem_platform_search(user_id=user_phone, query=query, top_k=3, score_threshold=0.4)
                         hits = [r.get("text") or r.get("memory") or str(r) for r in res]
+                        if hits:
+                            logger.info(f"Found {len(hits)} relevant memories for query: '{query}'")
+                        else:
+                            logger.info(f"No relevant memories found for query: '{query}'")
                         messages.append({
                             "role": "tool",
                             "tool_call_id": call.id,
@@ -747,9 +752,9 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     if _MEM0_AVAILABLE and mem0_client is not None:
         fetch_memories_function = FunctionSchema(
             name="fetch_memories",
-            description="Retrieve relevant user memories for current topic. Call only if helpful.",
+            description="Retrieve relevant user memories ONLY when the user explicitly mentions something from the past, asks about previous conversations, or references something specific that might be in memory. Do NOT call this for general conversation.",
             properties={
-                "query": {"type":"string","description":"What to search in the user's memories."}
+                "query": {"type":"string","description":"Specific topic, person, event, or detail to search for in past conversations."}
             },
             required=["query"]
         )
@@ -808,14 +813,24 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     # Register the function handler with the LLM service
     llm.register_function("send_whatsapp_message", send_whatsapp_message_handler)
 
-    # Register memory fetch handler if available
+    # Register memory fetch handler if available (only when explicitly needed)
     if _MEM0_AVAILABLE and mem0_client is not None:
         async def fetch_memories_handler(params: FunctionCallParams):
             try:
                 query = params.arguments.get("query", "") or ""
-                res = _mem_platform_search(user_id=caller_phone, query=query, top_k=5, score_threshold=0.35)
+                if not query.strip():
+                    await params.result_callback("NO_MEMORIES")
+                    return
+                
+                logger.info(f"Searching memories for query: '{query}'")
+                res = _mem_platform_search(user_id=caller_phone, query=query, top_k=3, score_threshold=0.4)
                 hits = [r.get("text") or r.get("memory") or str(r) for r in res]
-                await params.result_callback("\n".join(hits) if hits else "NO_MEMORIES")
+                if hits:
+                    logger.info(f"Found {len(hits)} relevant memories for query: '{query}'")
+                    await params.result_callback("\n".join(hits))
+                else:
+                    logger.info(f"No relevant memories found for query: '{query}'")
+                    await params.result_callback("NO_MEMORIES")
             except Exception as me:
                 logger.error(f"fetch_memories error: {me}")
                 await params.result_callback("NO_MEMORIES")
@@ -944,6 +959,9 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         # Additional small delay to ensure audio finishes
         await asyncio.sleep(2)
         
+        # Store conversation in memory before ending call
+        await store_conversation_at_end()
+        
         # Clean up transport
         await transport.cleanup()
         
@@ -958,29 +976,55 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         timeout=get_timeout_for_retry(1)  # Start with first timeout value (15.0)
     )
 
-    # Memory service (per-turn storage + retrieval) using Mem0 Platform
-    memory_service = None
-    if _MEM0_AVAILABLE and mem0_client is not None:
-        try:
-            memory_service = Mem0MemoryService(
-                api_key=os.getenv("MEM0_API_KEY"),
-                user_id=caller_phone if caller_phone and caller_phone != "Unknown" else (caller_name or "unknown"),
-                agent_id="meher"
-            )
-            logger.info(f"Mem0MemoryService attached: user_id={caller_phone}")
-        except Exception as e:
-            logger.error(f"Mem0MemoryService init failed: {e}")
-            memory_service = None
+    # Memory will be stored at the end of the call, not per-turn
+    conversation_messages = []  # Track conversation for end-of-call storage
+    
+    async def store_conversation_at_end():
+        """Store the entire conversation in memory after the call ends"""
+        if _MEM0_AVAILABLE and mem0_client is not None and caller_phone and caller_phone != "Unknown":
+            if conversation_messages:
+                try:
+                    _mem_platform_add_messages(
+                        user_id=caller_phone,
+                        messages=conversation_messages,
+                        run_id=call_sid or "voice",
+                    )
+                    logger.info(f"Stored conversation with {len(conversation_messages)} messages for {caller_phone}")
+                except Exception as e:
+                    logger.error(f"End-of-call memory storage failed: {e}")
+    
+    # Track conversation turns for end-of-call storage
+    original_push_frame = agg.user().push_frame
+    def track_user_message(frame):
+        """Track user messages for memory storage"""
+        if hasattr(frame, 'messages'):
+            for message in frame.messages:
+                if message.get("role") == "user":
+                    conversation_messages.append({
+                        "role": "user", 
+                        "content": message.get("content", "")[:500]
+                    })
+        return original_push_frame(frame)
+    agg.user().push_frame = track_user_message
+    
+    original_assistant_push_frame = agg.assistant().push_frame
+    def track_assistant_message(frame):
+        """Track assistant messages for memory storage"""
+        if hasattr(frame, 'messages'):
+            for message in frame.messages:
+                if message.get("role") == "assistant":
+                    conversation_messages.append({
+                        "role": "assistant", 
+                        "content": message.get("content", "")[:500]
+                    })
+        return original_assistant_push_frame(frame)
+    agg.assistant().push_frame = track_assistant_message
 
     pipeline_steps = [
         transport.input(),     # caller audio -> PCM via serializer
         stt,                   # speech -> text
         user_idle,             # UserIdleProcessor automatically resets on UserStartedSpeakingFrame
         agg.user(),            # add user text to context
-    ]
-    if memory_service is not None:
-        pipeline_steps.append(memory_service)
-    pipeline_steps += [
         llm,                   # text -> text
         tts,                   # text -> speech
         transport.output(),    # PCM -> back to Twilio via serializer
@@ -1007,6 +1051,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
                 "task": task,
                 "transport": transport,
                 "display_name": caller_display_name,
+                "conversation_messages": conversation_messages,  # Store conversation messages in session
             }
             logger.info(f"Registered active session for {caller_phone}")
     except Exception:
@@ -1092,6 +1137,23 @@ async def ws_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         logger.info("Twilio WebSocket disconnected")
+        # Store conversation in memory before cleanup
+        try:
+            if 'caller_number' in locals() and caller_number:
+                caller_phone = extract_phone_number(caller_number)
+                if caller_phone and caller_phone != "Unknown" and caller_phone in active_sessions:
+                    session = active_sessions[caller_phone]
+                    conversation_messages = session.get("conversation_messages", [])
+                    if conversation_messages and _MEM0_AVAILABLE and mem0_client is not None:
+                        _mem_platform_add_messages(
+                            user_id=caller_phone,
+                            messages=conversation_messages,
+                            run_id=session.get("call_sid") or "voice",
+                        )
+                        logger.info(f"Stored conversation with {len(conversation_messages)} messages for {caller_phone} on disconnect")
+        except Exception as e:
+            logger.error(f"Memory storage on disconnect failed: {e}")
+        
         # Clean up stored caller info on disconnect
         if 'call_sid' in locals() and call_sid and call_sid in caller_info_storage:
             del caller_info_storage[call_sid]
