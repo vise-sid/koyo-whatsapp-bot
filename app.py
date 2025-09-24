@@ -893,21 +893,21 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     original_user_push = agg.user().push_frame
     original_assistant_push = agg.assistant().push_frame
     
-    def capture_user_message(frame):
+    def capture_user_message(frame, *args, **kwargs):
         """Capture user messages from voice input"""
         if hasattr(frame, 'messages'):
             for message in frame.messages:
                 if message.get("role") == "user":
                     asyncio.create_task(track_voice_message("user", message.get("content", "")))
-        return original_user_push(frame)
+        return original_user_push(frame, *args, **kwargs)
     
-    def capture_assistant_message(frame):
+    def capture_assistant_message(frame, *args, **kwargs):
         """Capture assistant messages from voice output"""
         if hasattr(frame, 'messages'):
             for message in frame.messages:
                 if message.get("role") == "assistant":
                     asyncio.create_task(track_voice_message("character", message.get("content", "")))
-        return original_assistant_push(frame)
+        return original_assistant_push(frame, *args, **kwargs)
     
     # Apply the message capture functions
     agg.user().push_frame = capture_user_message
