@@ -875,49 +875,39 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         timeout=get_timeout_for_retry(1)  # Start with first timeout value (15.0)
     )
     
-    # Track conversation for Firebase storage
-    voice_conversation_messages = []
-    
-    # Custom message tracking for voice conversations
-    async def track_voice_message(sender: str, content: str):
-        """Track voice conversation messages for Firebase storage"""
-        if content and content.strip():
-            voice_conversation_messages.append({
-                "sender": sender,
-                "content": content,
-                "timestamp": datetime.now()
-            })
-            logger.debug(f"Tracked voice message: {sender} - {content[:50]}...")
-    
-    # Override the aggregators to capture messages
-    original_user_push = agg.user().push_frame
-    original_assistant_push = agg.assistant().push_frame
-    
-    def capture_user_message(frame, *args, **kwargs):
-        """Capture user messages from voice input"""
-        if hasattr(frame, 'messages'):
-            for message in frame.messages:
-                if message.get("role") == "user":
-                    asyncio.create_task(track_voice_message("user", message.get("content", "")))
-        return original_user_push(frame, *args, **kwargs)
-    
-    def capture_assistant_message(frame, *args, **kwargs):
-        """Capture assistant messages from voice output"""
-        if hasattr(frame, 'messages'):
-            for message in frame.messages:
-                if message.get("role") == "assistant":
-                    asyncio.create_task(track_voice_message("character", message.get("content", "")))
-        return original_assistant_push(frame, *args, **kwargs)
-    
-    # Apply the message capture functions
-    agg.user().push_frame = capture_user_message
-    agg.assistant().push_frame = capture_assistant_message
+    # We'll use the context aggregator's message history instead of tracking separately
     
     async def save_voice_conversation_to_firebase():
-        """Save all voice conversation messages to Firebase"""
-        if voice_conversation_messages and caller_phone and caller_phone != "Unknown":
+        """Save all voice conversation messages to Firebase using context aggregator"""
+        if caller_phone and caller_phone != "Unknown":
             try:
-                for msg in voice_conversation_messages:
+                # Get all messages from the context aggregator
+                user_messages = agg.user().get_messages()
+                assistant_messages = agg.assistant().get_messages()
+                
+                # Combine and save all messages
+                all_messages = []
+                
+                # Add user messages
+                for msg in user_messages:
+                    if msg.get("role") == "user" and msg.get("content"):
+                        all_messages.append({
+                            "sender": "user",
+                            "content": msg["content"],
+                            "timestamp": datetime.now()  # We don't have exact timestamp from aggregator
+                        })
+                
+                # Add assistant messages
+                for msg in assistant_messages:
+                    if msg.get("role") == "assistant" and msg.get("content"):
+                        all_messages.append({
+                            "sender": "character", 
+                            "content": msg["content"],
+                            "timestamp": datetime.now()  # We don't have exact timestamp from aggregator
+                        })
+                
+                # Save to Firebase
+                for msg in all_messages:
                     await save_message_to_firebase(
                         user_id=caller_phone,
                         sender=msg["sender"],
@@ -926,7 +916,8 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
                         conversation_type="voice",
                         call_sid=call_sid
                     )
-                logger.info(f"Saved {len(voice_conversation_messages)} voice messages to Firebase for {caller_phone}")
+                
+                logger.info(f"Saved {len(all_messages)} voice messages to Firebase for {caller_phone}")
             except Exception as e:
                 logger.error(f"Failed to save voice conversation to Firebase: {e}")
 
@@ -962,6 +953,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
                 "task": task,
                 "transport": transport,
                 "display_name": caller_display_name,
+                "context_aggregator": agg,  # Store the context aggregator for message access
             }
             logger.info(f"Registered active session for {caller_phone}")
     except Exception:
@@ -999,6 +991,65 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     async def _on_tts_end(transport, frame):
         """Log when TTS ends"""
         logger.info("TTS audio generation completed")
+    
+    @transport.event_handler("on_client_disconnected")
+    async def _on_client_disconnected(transport, client):
+        """Handle client disconnection - save conversation and cleanup"""
+        logger.info("Client disconnected, saving conversation and cleaning up")
+        
+        # Save voice conversation to Firebase using context aggregator
+        if caller_phone and caller_phone != "Unknown":
+            try:
+                # Get messages from context aggregator
+                user_messages = agg.user().get_messages()
+                assistant_messages = agg.assistant().get_messages()
+                
+                # Combine and save all messages
+                all_messages = []
+                
+                # Add user messages
+                for msg in user_messages:
+                    if msg.get("role") == "user" and msg.get("content"):
+                        all_messages.append({
+                            "sender": "user",
+                            "content": msg["content"],
+                            "timestamp": datetime.now()
+                        })
+                
+                # Add assistant messages
+                for msg in assistant_messages:
+                    if msg.get("role") == "assistant" and msg.get("content"):
+                        all_messages.append({
+                            "sender": "character", 
+                            "content": msg["content"],
+                            "timestamp": datetime.now()
+                        })
+                
+                # Save to Firebase
+                if all_messages:
+                    logger.info(f"Saving {len(all_messages)} voice messages to Firebase for {caller_phone}")
+                    for msg in all_messages:
+                        await save_message_to_firebase(
+                            user_id=caller_phone,
+                            sender=msg["sender"],
+                            content=msg["content"],
+                            timestamp=msg["timestamp"],
+                            conversation_type="voice",
+                            call_sid=call_sid
+                        )
+                    logger.info(f"Successfully saved voice conversation to Firebase for {caller_phone}")
+            except Exception as e:
+                logger.error(f"Failed to save voice conversation on disconnect: {e}")
+        
+        # Clean up stored caller info
+        if call_sid and call_sid in caller_info_storage:
+            del caller_info_storage[call_sid]
+            logger.info(f"Cleaned up caller info on disconnect for CallSid: {call_sid}")
+        
+        # Clean up active session
+        if caller_phone and caller_phone in active_sessions:
+            del active_sessions[caller_phone]
+            logger.info(f"Deregistered active session for {caller_phone}")
 
     # Enhanced pipeline runner with better audio processing
     runner = PipelineRunner(
@@ -1047,14 +1098,60 @@ async def ws_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         logger.info("Twilio WebSocket disconnected")
+        
         # Save voice conversation to Firebase before cleanup
         try:
             if 'caller_number' in locals() and caller_number:
                 caller_phone = extract_phone_number(caller_number)
                 if caller_phone and caller_phone != "Unknown":
-                    # Note: voice_conversation_messages would need to be accessible here
-                    # This is a limitation of the current scope - messages are saved in terminate_call_after_goodbye
-                    logger.info(f"Voice conversation will be saved when call terminates for {caller_phone}")
+                    # Get the session and save conversation using context aggregator
+                    session = active_sessions.get(caller_phone)
+                    if session and session.get("context_aggregator"):
+                        agg = session["context_aggregator"]
+                        
+                        # Get messages from context aggregator
+                        user_messages = agg.user().get_messages()
+                        assistant_messages = agg.assistant().get_messages()
+                        
+                        # Combine and save all messages
+                        all_messages = []
+                        
+                        # Add user messages
+                        for msg in user_messages:
+                            if msg.get("role") == "user" and msg.get("content"):
+                                all_messages.append({
+                                    "sender": "user",
+                                    "content": msg["content"],
+                                    "timestamp": datetime.now()
+                                })
+                        
+                        # Add assistant messages
+                        for msg in assistant_messages:
+                            if msg.get("role") == "assistant" and msg.get("content"):
+                                all_messages.append({
+                                    "sender": "character", 
+                                    "content": msg["content"],
+                                    "timestamp": datetime.now()
+                                })
+                        
+                        # Save to Firebase
+                        if all_messages:
+                            logger.info(f"Saving {len(all_messages)} voice messages to Firebase for {caller_phone}")
+                            for msg in all_messages:
+                                await save_message_to_firebase(
+                                    user_id=caller_phone,
+                                    sender=msg["sender"],
+                                    content=msg["content"],
+                                    timestamp=msg["timestamp"],
+                                    conversation_type="voice",
+                                    call_sid=call_sid
+                                )
+                            logger.info(f"Successfully saved voice conversation to Firebase for {caller_phone}")
+                    
+                    # Terminate the pipeline task to properly end the call
+                    if session and session.get("task"):
+                        logger.info("Terminating pipeline task due to WebSocket disconnect")
+                        await session["task"].queue_frames([EndFrame()])
         except Exception as e:
             logger.error(f"Error handling voice conversation save on disconnect: {e}")
         
@@ -1062,6 +1159,7 @@ async def ws_endpoint(websocket: WebSocket):
         if 'call_sid' in locals() and call_sid and call_sid in caller_info_storage:
             del caller_info_storage[call_sid]
             logger.info(f"Cleaned up caller info on disconnect for CallSid: {call_sid}")
+        
         # Clean up active session
         try:
             if 'caller_number' in locals() and caller_number:
