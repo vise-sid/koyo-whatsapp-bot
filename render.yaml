@@ -22,5 +22,3 @@ services:
         value: "true"
       - key: TWILIO_WHATSAPP_FROM
         sync: false
-      - key: MEM0_API_KEY
-        sync: false

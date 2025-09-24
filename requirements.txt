@@ -6,6 +6,6 @@ pytz>=2023.3
 httpx>=0.25.0
 
 # Pipecat and extras for FastAPI websockets, Deepgram STT, ElevenLabs TTS, OpenAI LLM, Silero VAD
-pipecat-ai[websocket,deepgram,elevenlabs,openai,silero,mem0]>=0.0.85
+pipecat-ai[websocket,deepgram,elevenlabs,openai,silero]>=0.0.85
 openai>=1.40.0
-mem0ai>=0.1.0
+firebase-admin>=6.4.0

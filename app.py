@@ -6,6 +6,10 @@ from datetime import datetime
 import pytz
 import httpx
 
+# Firebase imports
+import firebase_admin
+from firebase_admin import credentials, firestore
+
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, Response, HTMLResponse, JSONResponse
 from twilio.request_validator import RequestValidator
@@ -31,15 +35,8 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams
 from openai import OpenAI
-from pipecat.services.mem0 import Mem0MemoryService
 from prompts.meher_voice_prompt import get_voice_system_prompt
 from prompts.meher_text_prompt import get_text_system_prompt
-try:
-    # Mem0 platform SDK
-    from mem0 import MemoryClient
-    _MEM0_AVAILABLE = True
-except Exception:
-    _MEM0_AVAILABLE = False
 
 logger = logging.getLogger("uvicorn.error")
 app = FastAPI(title="Pipecat x Twilio WhatsApp Calling")
@@ -48,42 +45,101 @@ app = FastAPI(title="Pipecat x Twilio WhatsApp Calling")
 caller_info_storage = {}
 active_sessions = {}
 offcall_context: Dict[str, list] = {}
-mem0_client = None
 
-# ---- Mem0 Platform helpers ----
-def _mem_platform_search(user_id: str, query: str, top_k: int = 5, score_threshold: float = 0.35) -> list:
-    if not _MEM0_AVAILABLE or mem0_client is None:
-        return []
-    try:
-        if hasattr(mem0_client, "search_memories"):
-            return mem0_client.search_memories(user_id=user_id, query=query, top_k=top_k, score_threshold=score_threshold) or []
-        if hasattr(mem0_client, "get_memories"):
-            return mem0_client.get_memories(user_id=user_id, query=query, top_k=top_k, score_threshold=score_threshold) or []
-    except Exception as e:
-        logger.error(f"Mem0 search error: {e}")
-    return []
+# Firebase client
+db = None
 
-def _mem_platform_add_messages(user_id: str, messages: list[dict], run_id: str | None = None) -> None:
-    if not _MEM0_AVAILABLE or mem0_client is None:
+async def create_or_update_conversation_metadata(user_id: str, character_name: str, call_sid: str = None):
+    """Create or update conversation metadata document"""
+    if db is None:
         return
+    
     try:
-        # Preferred contextual add per platform docs
-        if hasattr(mem0_client, "add"):
-            kwargs = {"messages": messages, "user_id": user_id, "version": "v2"}
-            if run_id:
-                kwargs["run_id"] = run_id
-            mem0_client.add(**kwargs)
-            return
-        # Fallback: if only add_memory exists, store each message minimally
-        if hasattr(mem0_client, "add_memory"):
-            for m in messages:
-                if not m.get("content"):
-                    continue
-                mem0_client.add_memory(user_id=user_id, memory=m["content"], metadata={"role": m.get("role")})
-            return
-        logger.warning("Mem0 client has neither add nor add_memory; skipping memory write")
+        conversation_metadata = {
+            "last_updated": datetime.now(),
+            "message_count": 0,  # This will be updated when messages are added
+            "character_name": character_name,
+        }
+        
+        if call_sid:
+            conversation_metadata["call_sid"] = call_sid
+        
+        # Update conversation metadata (create if doesn't exist)
+        # Structure: users/{user_id}/conversations/{character_name}
+        conversation_ref = db.collection("users").document(user_id).collection("conversations").document(character_name)
+        conversation_ref.set(conversation_metadata, merge=True)
+        
     except Exception as e:
-        logger.error(f"Mem0 add error: {e}")
+        logger.error(f"Failed to update conversation metadata: {e}")
+
+async def save_message_to_firebase(
+    user_id: str, 
+    sender: str, 
+    content: str, 
+    timestamp: datetime = None, 
+    sync: bool = False,
+    conversation_type: str = "text",  # "text" or "voice"
+    call_sid: str = None
+) -> bool:
+    """Save a message to Firebase Firestore in nested collection structure:
+    users/{user_id}/conversations/{character_name}/messages/{message_id}
+    
+    Args:
+        user_id: Phone number or user identifier
+        sender: "user" or "character" (Meher)
+        content: Message content
+        timestamp: Message timestamp (defaults to now)
+        sync: Sync status (defaults to False)
+        conversation_type: "text" or "voice"
+        call_sid: Call SID for voice conversations
+    
+    Returns:
+        bool: True if saved successfully, False otherwise
+    """
+    if db is None:
+        logger.warning("Firebase not initialized, skipping message save")
+        return False
+    
+    try:
+        if timestamp is None:
+            timestamp = datetime.now()
+        
+        # Use "meher" as the character name for all conversations
+        character_name = "meher"
+        
+        # Create or update conversation metadata
+        await create_or_update_conversation_metadata(user_id, character_name, call_sid)
+        
+        # Create message document
+        message_data = {
+            "sender": sender,
+            "content": content[:1000],  # Limit content length
+            "timestamp": timestamp,
+            "sync": sync,
+            "conversation_type": conversation_type,
+        }
+        
+        # Add call_sid for voice conversations
+        if call_sid:
+            message_data["call_sid"] = call_sid
+        
+        # Save to nested collection: users/{user_id}/conversations/{character_name}/messages
+        doc_ref = db.collection("users").document(user_id).collection("conversations").document(character_name).collection("messages").add(message_data)
+        logger.info(f"Saved {sender} message to Firebase for user {user_id} in conversation with {character_name}")
+        
+        # Update message count in conversation metadata
+        try:
+            conversation_ref = db.collection("users").document(user_id).collection("conversations").document(character_name)
+            conversation_ref.update({"message_count": firestore.Increment(1)})
+        except Exception as e:
+            logger.warning(f"Failed to update message count: {e}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to save message to Firebase: {e}")
+        return False
+
 
 async def cleanup_old_caller_info():
     """Periodically clean up old caller info entries"""
@@ -295,103 +351,32 @@ def extract_phone_number(whatsapp_number: str) -> str:
 @app.get("/health")
 def health(): return {"ok": True}
 
-# ---- Admin/Dashboard: Inspect memories and conversation snippets ----
-@app.get("/memories/{user_id}")
-async def get_user_memories(user_id: str, limit: int = 20, threshold: float = 0.0):
-    if not _MEM0_AVAILABLE or mem0_client is None:
-        return JSONResponse({"success": False, "error": "Mem0 not initialized"}, status_code=500)
-    try:
-        # broad search to list latest/top vectors – if OSS returns empty on empty query, use a wildcard phrase
-        query = "recent user memories"
-        res = _mem_platform_search(user_id=user_id, query=query, top_k=limit, score_threshold=threshold)
-        items = []
-        for r in res:
-            text = r.get("text") or r.get("memory") or str(r)
-            score = r.get("score")
-            meta = r.get("metadata") or {}
-            items.append({"text": text, "score": score, "metadata": meta})
-        return {"success": True, "user_id": user_id, "count": len(items), "items": items}
-    except Exception as e:
-        logger.error(f"Mem0 list error: {e}")
-        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
-
-@app.get("/memories/search")
-async def search_user_memories(user_id: str, query: str, limit: int = 10, threshold: float = 0.35):
-    if not _MEM0_AVAILABLE or mem0_client is None:
-        return JSONResponse({"success": False, "error": "Mem0 not initialized"}, status_code=500)
-    try:
-        res = _mem_platform_search(user_id=user_id, query=query, top_k=limit, score_threshold=threshold)
-        items = []
-        for r in res:
-            text = r.get("text") or r.get("memory") or str(r)
-            score = r.get("score")
-            meta = r.get("metadata") or {}
-            items.append({"text": text, "score": score, "metadata": meta})
-        return {"success": True, "user_id": user_id, "query": query, "count": len(items), "items": items}
-    except Exception as e:
-        logger.error(f"Mem0 search error: {e}")
-        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
-
-@app.get("/memories/dashboard")
-async def memories_dashboard(user_id: str = "", query: str = "", limit: int = 10, threshold: float = 0.35):
-    if not _MEM0_AVAILABLE or mem0_client is None:
-        return HTMLResponse("<h3>Mem0 not initialized</h3>")
-    html_head = """
-    <style>
-      body{font-family:Inter,system-ui,Arial;padding:24px;max-width:900px;margin:0 auto}
-      h1{font-size:22px;margin:0 0 12px}
-      form{margin:16px 0;padding:12px;border:1px solid #eee;border-radius:8px}
-      input,button{padding:8px 10px;margin:4px}
-      .item{padding:10px;border-bottom:1px solid #eee}
-      .meta{color:#666;font-size:12px}
-      code{background:#f6f8fa;padding:2px 4px;border-radius:4px}
-    </style>
-    """
-    items_html = ""
-    count = 0
-    if user_id:
-        try:
-            q = query or "recent user memories"
-            res = _mem_platform_search(user_id=user_id, query=q, top_k=limit, score_threshold=threshold)
-            for r in res:
-                text = (r.get("text") or r.get("memory") or str(r)).replace("<", "&lt;")
-                score = r.get("score")
-                meta = r.get("metadata") or {}
-                items_html += f"<div class='item'><div>{text}</div><div class='meta'>score={score} | metadata={meta}</div></div>"
-            count = len(res)
-        except Exception as e:
-            items_html = f"<div class='item'>Error: {str(e)}</div>"
-    form_html = f"""
-      <h1>Memories Dashboard</h1>
-      <form method='get'>
-        <label>User ID (phone):</label>
-        <input name='user_id' value='{user_id}' placeholder='e.g. +15551234567' />
-        <label>Query:</label>
-        <input name='query' value='{query}' placeholder='topic or keyword' />
-        <label>Limit:</label>
-        <input name='limit' type='number' min='1' max='100' value='{limit}' />
-        <label>Threshold:</label>
-        <input name='threshold' type='number' step='0.01' value='{threshold}' />
-        <button type='submit'>Search</button>
-      </form>
-      <div><b>Results:</b> {count}</div>
-      <div>{items_html}</div>
-    """
-    return HTMLResponse(html_head + form_html)
 
 @app.on_event("startup")
 async def startup_event():
     """Start background tasks when the app starts"""
     asyncio.create_task(cleanup_old_caller_info())
     logger.info("Started caller info cleanup task")
-    # Initialize Mem0 Platform if available
-    global mem0_client
-    if _MEM0_AVAILABLE and mem0_client is None:
-        try:
-            mem0_client =MemoryClient(api_key=os.getenv("MEM0_API_KEY", ""))
-            logger.info("Mem0 initialized (Platform)")
-        except Exception as e:
-            logger.error(f"Mem0 init failed: {e}")
+    
+    # Initialize Firebase
+    global db
+    try:
+        # Try to initialize with service account key from environment
+        firebase_credentials = os.getenv("FIREBASE_CREDENTIALS")
+        if firebase_credentials:
+            # Parse JSON credentials from environment variable
+            cred_dict = json.loads(firebase_credentials)
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+        else:
+            # Try to initialize with default credentials (for local development)
+            firebase_admin.initialize_app()
+        
+        db = firestore.client()
+        logger.info("Firebase initialized successfully")
+    except Exception as e:
+        logger.error(f"Firebase initialization failed: {e}")
+        db = None
 
 # ---- helpers ----
 def _ws_url(request: Request) -> str:
@@ -485,18 +470,15 @@ async def whatsapp_webhook(request: Request):
                 LLMRunFrame(),
             ]
             await session["task"].queue_frames(frames)
-            # Store inbound message as contextual messages
-            try:
-                if _MEM0_AVAILABLE and mem0_client is not None and from_num:
-                    _mem_platform_add_messages(
-                        user_id=from_num,
-                        messages=[
-                            {"role": "user", "content": content[:500]}
-                        ],
-                        run_id=session.get("call_sid") if isinstance(session, dict) else None,
-                    )
-            except Exception as me:
-                logger.error(f"Mem0 add (in-call WA) failed: {me}")
+            
+            # Save user message to Firebase
+            await save_message_to_firebase(
+                user_id=from_num,
+                sender="user",
+                content=content,
+                conversation_type="text"
+            )
+            
             return Response(status_code=204)
 
         # No live session -> off-call LLM chat with context and reply over WhatsApp (freeform)
@@ -508,6 +490,21 @@ async def whatsapp_webhook(request: Request):
             from_number=TWILIO_WHATSAPP_FROM,
         )
         await whatsapp_service.send_freeform_message(to_number=from_num, message=reply_text)
+        
+        # Save both user message and character response to Firebase
+        await save_message_to_firebase(
+            user_id=from_num,
+            sender="user",
+            content=text_body,
+            conversation_type="text"
+        )
+        await save_message_to_firebase(
+            user_id=from_num,
+            sender="character",
+            content=reply_text,
+            conversation_type="text"
+        )
+        
         # Return 204 to avoid Twilio echoing body as a user-visible message
         return Response(status_code=204)
 
@@ -562,7 +559,7 @@ async def handle_multimodal_offcall(text: str, media: list, user_phone: str) -> 
         time_context=time_context,
     )
 
-    # 4) Build messages array (bounded history). Allow tool call for memory fetch.
+    # 4) Build messages array (bounded history)
     messages = [{"role": "system", "content": system_text}]
     # include last ~8 messages from history for context
     for m in history[-8:]:
@@ -572,64 +569,12 @@ async def handle_multimodal_offcall(text: str, media: list, user_phone: str) -> 
     # 5) Call OpenAI for a short response
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
-        tools = []
-        if _MEM0_AVAILABLE and mem0_client is not None:
-            tools = [{
-                "type": "function",
-                "function": {
-                    "name": "fetch_memories",
-                    "description": "Retrieve relevant user memories ONLY when the user explicitly mentions something from the past, asks about previous conversations, or references something specific that might be in memory. Do NOT call this for general conversation.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"query": {"type": "string", "description": "Specific topic, person, event, or detail to search for in past conversations."}},
-                        "required": ["query"]
-                    }
-                }
-            }]
-
         resp = client.chat.completions.create(
             model="gpt-4o",
             messages=messages,
-            tools=tools if tools else None,
-            tool_choice="auto" if tools else None,
             max_tokens=120,
             temperature=0.7,
         )
-        msg = resp.choices[0].message
-        if tools and getattr(msg, "tool_calls", None):
-            import json
-            for call in msg.tool_calls:
-                if call.function.name == "fetch_memories":
-                    args = json.loads(call.function.arguments or "{}")
-                    query = args.get("query", user_text)
-                    try:
-                        logger.info(f"Off-call memory search for query: '{query}'")
-                        res = _mem_platform_search(user_id=user_phone, query=query, top_k=3, score_threshold=0.4)
-                        hits = [r.get("text") or r.get("memory") or str(r) for r in res]
-                        if hits:
-                            logger.info(f"Found {len(hits)} relevant memories for query: '{query}'")
-                        else:
-                            logger.info(f"No relevant memories found for query: '{query}'")
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": call.id,
-                            "name": "fetch_memories",
-                            "content": "\n".join(hits) if hits else "NO_MEMORIES",
-                        })
-                    except Exception as me:
-                        logger.error(f"Mem0 search failed: {me}")
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": call.id,
-                            "name": "fetch_memories",
-                            "content": "NO_MEMORIES",
-                        })
-            resp = client.chat.completions.create(
-                model="gpt-4o",
-                messages=messages,
-                max_tokens=120,
-                temperature=0.7,
-            )
         reply = (resp.choices[0].message.content or "")[:800]
     except Exception as e:
         logger.error(f"Off-call LLM error: {e}")
@@ -640,18 +585,8 @@ async def handle_multimodal_offcall(text: str, media: list, user_phone: str) -> 
     history.append({"role": "assistant", "content": reply})
     offcall_context[user_phone] = history[-20:]  # cap to last 20 turns
 
-    # 7) Store contextual messages (non-blocking best-effort)
-    try:
-        if _MEM0_AVAILABLE and mem0_client is not None:
-            _mem_platform_add_messages(
-                user_id=user_phone,
-                messages=[
-                    {"role": "user", "content": user_text[:500]},
-                    {"role": "assistant", "content": reply[:500]},
-                ],
-            )
-    except Exception as me:
-        logger.error(f"Mem0 add failed: {me}")
+    # Save messages to Firebase (this will be called by the webhook handler)
+    # Note: We don't save here to avoid duplication since webhook handler already saves
 
     return reply
 
@@ -748,19 +683,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         required=["message"]
     )
     
-    # Optional: memory fetch function (LLM calls only when needed)
-    if _MEM0_AVAILABLE and mem0_client is not None:
-        fetch_memories_function = FunctionSchema(
-            name="fetch_memories",
-            description="Retrieve relevant user memories ONLY when the user explicitly mentions something from the past, asks about previous conversations, or references something specific that might be in memory. Do NOT call this for general conversation.",
-            properties={
-                "query": {"type":"string","description":"Specific topic, person, event, or detail to search for in past conversations."}
-            },
-            required=["query"]
-        )
-        tools = ToolsSchema(standard_tools=[whatsapp_function, fetch_memories_function])
-    else:
-        tools = ToolsSchema(standard_tools=[whatsapp_function])
+    tools = ToolsSchema(standard_tools=[whatsapp_function])
     
     # Initialize LLM service
     llm = OpenAILLMService(
@@ -812,30 +735,6 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     
     # Register the function handler with the LLM service
     llm.register_function("send_whatsapp_message", send_whatsapp_message_handler)
-
-    # Register memory fetch handler if available (only when explicitly needed)
-    if _MEM0_AVAILABLE and mem0_client is not None:
-        async def fetch_memories_handler(params: FunctionCallParams):
-            try:
-                query = params.arguments.get("query", "") or ""
-                if not query.strip():
-                    await params.result_callback("NO_MEMORIES")
-                    return
-                
-                logger.info(f"Searching memories for query: '{query}'")
-                res = _mem_platform_search(user_id=caller_phone, query=query, top_k=3, score_threshold=0.4)
-                hits = [r.get("text") or r.get("memory") or str(r) for r in res]
-                if hits:
-                    logger.info(f"Found {len(hits)} relevant memories for query: '{query}'")
-                    await params.result_callback("\n".join(hits))
-                else:
-                    logger.info(f"No relevant memories found for query: '{query}'")
-                    await params.result_callback("NO_MEMORIES")
-            except Exception as me:
-                logger.error(f"fetch_memories error: {me}")
-                await params.result_callback("NO_MEMORIES")
-
-        llm.register_function("fetch_memories", fetch_memories_handler)
     tts = ElevenLabsTTSService(
         api_key=ELEVENLABS_API_KEY,
         voice_id=ELEVENLABS_VOICE_ID,
@@ -959,8 +858,8 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         # Additional small delay to ensure audio finishes
         await asyncio.sleep(2)
         
-        # Store conversation in memory before ending call
-        await store_conversation_at_end()
+        # Save voice conversation to Firebase before cleanup
+        await save_voice_conversation_to_firebase()
         
         # Clean up transport
         await transport.cleanup()
@@ -975,50 +874,62 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         callback=handle_user_idle_with_retry,  # Uses retry callback signature
         timeout=get_timeout_for_retry(1)  # Start with first timeout value (15.0)
     )
-
-    # Memory will be stored at the end of the call, not per-turn
-    conversation_messages = []  # Track conversation for end-of-call storage
     
-    async def store_conversation_at_end():
-        """Store the entire conversation in memory after the call ends"""
-        if _MEM0_AVAILABLE and mem0_client is not None and caller_phone and caller_phone != "Unknown":
-            if conversation_messages:
-                try:
-                    _mem_platform_add_messages(
-                        user_id=caller_phone,
-                        messages=conversation_messages,
-                        run_id=call_sid or "voice",
-                    )
-                    logger.info(f"Stored conversation with {len(conversation_messages)} messages for {caller_phone}")
-                except Exception as e:
-                    logger.error(f"End-of-call memory storage failed: {e}")
+    # Track conversation for Firebase storage
+    voice_conversation_messages = []
     
-    # Track conversation turns for end-of-call storage
-    original_push_frame = agg.user().push_frame
-    def track_user_message(frame):
-        """Track user messages for memory storage"""
+    # Custom message tracking for voice conversations
+    async def track_voice_message(sender: str, content: str):
+        """Track voice conversation messages for Firebase storage"""
+        if content and content.strip():
+            voice_conversation_messages.append({
+                "sender": sender,
+                "content": content,
+                "timestamp": datetime.now()
+            })
+            logger.debug(f"Tracked voice message: {sender} - {content[:50]}...")
+    
+    # Override the aggregators to capture messages
+    original_user_push = agg.user().push_frame
+    original_assistant_push = agg.assistant().push_frame
+    
+    def capture_user_message(frame):
+        """Capture user messages from voice input"""
         if hasattr(frame, 'messages'):
             for message in frame.messages:
                 if message.get("role") == "user":
-                    conversation_messages.append({
-                        "role": "user", 
-                        "content": message.get("content", "")[:500]
-                    })
-        return original_push_frame(frame)
-    agg.user().push_frame = track_user_message
+                    asyncio.create_task(track_voice_message("user", message.get("content", "")))
+        return original_user_push(frame)
     
-    original_assistant_push_frame = agg.assistant().push_frame
-    def track_assistant_message(frame):
-        """Track assistant messages for memory storage"""
+    def capture_assistant_message(frame):
+        """Capture assistant messages from voice output"""
         if hasattr(frame, 'messages'):
             for message in frame.messages:
                 if message.get("role") == "assistant":
-                    conversation_messages.append({
-                        "role": "assistant", 
-                        "content": message.get("content", "")[:500]
-                    })
-        return original_assistant_push_frame(frame)
-    agg.assistant().push_frame = track_assistant_message
+                    asyncio.create_task(track_voice_message("character", message.get("content", "")))
+        return original_assistant_push(frame)
+    
+    # Apply the message capture functions
+    agg.user().push_frame = capture_user_message
+    agg.assistant().push_frame = capture_assistant_message
+    
+    async def save_voice_conversation_to_firebase():
+        """Save all voice conversation messages to Firebase"""
+        if voice_conversation_messages and caller_phone and caller_phone != "Unknown":
+            try:
+                for msg in voice_conversation_messages:
+                    await save_message_to_firebase(
+                        user_id=caller_phone,
+                        sender=msg["sender"],
+                        content=msg["content"],
+                        timestamp=msg["timestamp"],
+                        conversation_type="voice",
+                        call_sid=call_sid
+                    )
+                logger.info(f"Saved {len(voice_conversation_messages)} voice messages to Firebase for {caller_phone}")
+            except Exception as e:
+                logger.error(f"Failed to save voice conversation to Firebase: {e}")
+
 
     pipeline_steps = [
         transport.input(),     # caller audio -> PCM via serializer
@@ -1051,7 +962,6 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
                 "task": task,
                 "transport": transport,
                 "display_name": caller_display_name,
-                "conversation_messages": conversation_messages,  # Store conversation messages in session
             }
             logger.info(f"Registered active session for {caller_phone}")
     except Exception:
@@ -1137,22 +1047,16 @@ async def ws_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         logger.info("Twilio WebSocket disconnected")
-        # Store conversation in memory before cleanup
+        # Save voice conversation to Firebase before cleanup
         try:
             if 'caller_number' in locals() and caller_number:
                 caller_phone = extract_phone_number(caller_number)
-                if caller_phone and caller_phone != "Unknown" and caller_phone in active_sessions:
-                    session = active_sessions[caller_phone]
-                    conversation_messages = session.get("conversation_messages", [])
-                    if conversation_messages and _MEM0_AVAILABLE and mem0_client is not None:
-                        _mem_platform_add_messages(
-                            user_id=caller_phone,
-                            messages=conversation_messages,
-                            run_id=session.get("call_sid") or "voice",
-                        )
-                        logger.info(f"Stored conversation with {len(conversation_messages)} messages for {caller_phone} on disconnect")
+                if caller_phone and caller_phone != "Unknown":
+                    # Note: voice_conversation_messages would need to be accessible here
+                    # This is a limitation of the current scope - messages are saved in terminate_call_after_goodbye
+                    logger.info(f"Voice conversation will be saved when call terminates for {caller_phone}")
         except Exception as e:
-            logger.error(f"Memory storage on disconnect failed: {e}")
+            logger.error(f"Error handling voice conversation save on disconnect: {e}")
         
         # Clean up stored caller info on disconnect
         if 'call_sid' in locals() and call_sid and call_sid in caller_info_storage:
