@@ -1,131 +1,124 @@
-# Koyo WhatsApp Voice Bot
+# Koyo Voice & WhatsApp Integration
 
-A FastAPI application that provides AI-powered voice calling capabilities through Twilio WhatsApp integration using Pipecat AI framework.
+A FastAPI application that provides voice calling and WhatsApp messaging capabilities using Twilio, Pipecat, OpenAI, Deepgram, ElevenLabs, and Firebase.
 
-## Features
+## Project Structure
 
-- **WhatsApp Voice Calls**: Handle incoming voice calls through Twilio WhatsApp
-- **AI-Powered Conversations**: Uses OpenAI GPT-4o-mini for intelligent responses
-- **Speech-to-Text**: Deepgram STT for accurate voice recognition
-- **Text-to-Speech**: ElevenLabs TTS for natural voice synthesis
-- **Real-time Processing**: WebSocket-based audio streaming
-- **Voice Activity Detection**: Silero VAD for optimal conversation flow
+The codebase has been refactored into a clean, modular architecture:
 
-## Tech Stack
+```
+koyo_v9/
+├── app.py                          # Main FastAPI application
+├── app_original.py                 # Original monolithic app.py (backup)
+├── requirements.txt                # Python dependencies
+├── render.yaml                     # Deployment configuration
+├── prompts/                        # AI prompt templates
+│   ├── meher_text_prompt.py       # Text conversation prompts
+│   └── meher_voice_prompt.py      # Voice conversation prompts
+├── services/                       # Business logic services
+│   ├── __init__.py
+│   ├── whatsapp_service.py        # WhatsApp messaging via Twilio
+│   └── voice_session.py           # Voice call session management
+├── webhooks/                       # Webhook handlers
+│   ├── __init__.py
+│   ├── whatsapp_handler.py        # WhatsApp webhook processing
+│   └── voice_handler.py           # Twilio voice webhook processing
+├── database/                       # Database operations
+│   ├── __init__.py
+│   └── firebase_service.py        # Firebase Firestore operations
+└── utils/                          # Utility functions
+    ├── __init__.py
+    └── helpers.py                  # Common helper functions
+```
 
-- **FastAPI**: Web framework
-- **Pipecat AI**: Real-time AI pipeline framework
-- **Twilio**: WhatsApp voice calling and media streams
-- **OpenAI**: GPT-4o-mini for language processing
-- **Deepgram**: Speech-to-text service
-- **ElevenLabs**: Text-to-speech service
-- **Uvicorn**: ASGI server
+## Key Features
 
-## Environment Variables
+### Voice Calls
+- Real-time voice conversations using Pipecat
+- Speech-to-text with Deepgram
+- Text-to-speech with ElevenLabs
+- Multilingual support (Hindi/English)
+- Intelligent idle handling and call termination
+- Function calling for WhatsApp messaging and call termination
 
-The following environment variables need to be configured:
+### WhatsApp Integration
+- Template-based messaging for outbound messages
+- Freeform messaging for inbound conversations
+- Media processing (audio transcription, image captioning, document handling)
+- Context-aware off-call conversations
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `TWILIO_ACCOUNT_SID` | Your Twilio Account SID | Yes |
-| `TWILIO_AUTH_TOKEN` | Your Twilio Auth Token | Yes |
-| `OPENAI_API_KEY` | OpenAI API key for GPT-4o-mini | Yes |
-| `DEEPGRAM_API_KEY` | Deepgram API key for STT | Yes |
-| `ELEVENLABS_API_KEY` | ElevenLabs API key for TTS | Yes |
-| `ELEVENLABS_VOICE_ID` | ElevenLabs voice ID (default: "Rachel") | No |
-| `VALIDATE_TWILIO_SIGNATURE` | Validate Twilio webhook signatures (default: "false") | No |
+### Data Management
+- Firebase Firestore integration for conversation storage
+- Batch operations for efficient message saving
+- Session management with automatic cleanup
+- Conversation metadata tracking
 
-## Local Development
+## Architecture Improvements
 
-1. **Clone the repository**
-   ```bash
-   git clone <your-repo-url>
-   cd koyo_v9
-   ```
+### Modular Design
+- **Separation of Concerns**: Each module has a single responsibility
+- **Service Layer**: Business logic encapsulated in service classes
+- **Handler Layer**: Webhook processing separated from business logic
+- **Utility Layer**: Common functions centralized for reusability
 
-2. **Create a virtual environment**
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
+### Code Quality
+- **Type Hints**: Comprehensive type annotations throughout
+- **Documentation**: Detailed docstrings for all functions and classes
+- **Error Handling**: Robust exception handling with proper logging
+- **Async/Await**: Optimized asynchronous operations
 
-3. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Set up environment variables**
-   Create a `.env` file with your API keys:
-   ```env
-   TWILIO_ACCOUNT_SID=your_twilio_account_sid
-   TWILIO_AUTH_TOKEN=your_twilio_auth_token
-   OPENAI_API_KEY=your_openai_api_key
-   DEEPGRAM_API_KEY=your_deepgram_api_key
-   ELEVENLABS_API_KEY=your_elevenlabs_api_key
-   ELEVENLABS_VOICE_ID=Rachel
-   VALIDATE_TWILIO_SIGNATURE=false
-   ```
-
-5. **Run the application**
-   ```bash
-   uvicorn app:app --reload
-   ```
-
-The application will be available at `http://localhost:8000`
-
-## Deployment on Render.com
-
-1. **Push to GitHub**
-   - This repository is already configured for GitHub deployment
-
-2. **Deploy on Render**
-   - Connect your GitHub repository to Render
-   - Render will automatically detect the `render.yaml` configuration
-   - Set the required environment variables in Render dashboard
-   - Deploy!
-
-3. **Configure Twilio Webhooks**
-   - Set your Twilio Voice Request URL to: `https://your-render-app.onrender.com/voice`
-   - Set your Twilio Status Callback URL to: `https://your-render-app.onrender.com/status`
+### Maintainability
+- **Single Responsibility**: Each class and function has one clear purpose
+- **Dependency Injection**: Services are initialized with required dependencies
+- **Configuration**: Environment-based configuration management
+- **Logging**: Structured logging for debugging and monitoring
 
 ## API Endpoints
 
 - `GET /health` - Health check endpoint
-- `POST /voice` - Twilio webhook for incoming calls
-- `POST /status` - Twilio status callback endpoint
-- `WebSocket /ws` - WebSocket endpoint for media streams
+- `POST /whatsapp-webhook` - Handle incoming WhatsApp messages
+- `POST /voice` - Handle Twilio voice webhooks
+- `POST /status` - Twilio status callbacks
+- `WebSocket /ws` - Voice call WebSocket connection
 
-## Twilio Configuration
+## Environment Variables
 
-1. **WhatsApp Sandbox Setup**
-   - Enable WhatsApp in your Twilio Console
-   - Configure your WhatsApp number
-   - Set up webhook URLs pointing to your deployed app
+```bash
+TWILIO_ACCOUNT_SID=your_twilio_account_sid
+TWILIO_AUTH_TOKEN=your_twilio_auth_token
+OPENAI_API_KEY=your_openai_api_key
+DEEPGRAM_API_KEY=your_deepgram_api_key
+ELEVENLABS_API_KEY=your_elevenlabs_api_key
+ELEVENLABS_VOICE_ID=your_elevenlabs_voice_id
+FIREBASE_CREDENTIALS=your_firebase_credentials_json
+TWILIO_WHATSAPP_FROM=whatsapp:+your_twilio_whatsapp_number
+VALIDATE_TWILIO_SIGNATURE=true
+```
 
-2. **Voice Configuration**
-   - Create a TwiML App in Twilio Console
-   - Set the Voice Request URL to your `/voice` endpoint
-   - Configure your WhatsApp number to use this TwiML App
+## Development
 
-## Architecture
+1. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-The application uses a pipeline architecture:
+2. Set environment variables
 
-1. **Incoming Call**: Twilio receives WhatsApp voice call
-2. **Webhook**: Twilio sends webhook to `/voice` endpoint
-3. **TwiML Response**: Returns TwiML to connect to WebSocket
-4. **Media Stream**: Establishes WebSocket connection for audio streaming
-5. **AI Pipeline**: Processes audio through STT → LLM → TTS pipeline
-6. **Response**: Sends audio back to caller through Twilio
+3. Run the application:
+   ```bash
+   python app.py
+   ```
 
-## Contributing
+## Deployment
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
+The application is configured for deployment on Render with the provided `render.yaml` configuration.
 
-## License
+## Benefits of the Refactored Architecture
 
-This project is licensed under the MIT License.
+1. **Maintainability**: Code is organized logically and easy to navigate
+2. **Testability**: Each module can be tested independently
+3. **Scalability**: Services can be scaled or replaced individually
+4. **Reusability**: Common functionality is centralized in utils
+5. **Debugging**: Clear separation makes issues easier to isolate
+6. **Documentation**: Self-documenting code with comprehensive docstrings
+7. **Type Safety**: Type hints prevent runtime errors and improve IDE support
