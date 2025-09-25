@@ -683,7 +683,20 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         required=["message"]
     )
     
-    tools = ToolsSchema(standard_tools=[whatsapp_function])
+    # Define call termination function schema
+    terminate_call_function = FunctionSchema(
+        name="terminate_voice_call",
+        description="Terminate the current voice call. Use this when the conversation has naturally concluded, when the user says goodbye, or when it's appropriate to end the call. Always say goodbye before terminating.",
+        properties={
+            "reason": {
+                "type": "string",
+                "description": "Brief reason for ending the call (e.g., 'conversation concluded', 'user said goodbye', 'call completed successfully')"
+            }
+        },
+        required=["reason"]
+    )
+    
+    tools = ToolsSchema(standard_tools=[whatsapp_function, terminate_call_function])
     
     # Initialize LLM service
     llm = OpenAILLMService(
@@ -735,6 +748,54 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     
     # Register the function handler with the LLM service
     llm.register_function("send_whatsapp_message", send_whatsapp_message_handler)
+    
+    # Register call termination function handler
+    async def terminate_call_handler(params: FunctionCallParams):
+        """Handle voice call termination function calls"""
+        try:
+            # Check if connection is still active
+            if hasattr(transport, '_websocket') and transport._websocket.client_state.name != 'CONNECTED':
+                logger.info("Connection already closed, cannot terminate call")
+                await params.result_callback("❌ Connection already closed")
+                return
+            
+            reason = params.arguments.get("reason", "call terminated")
+            logger.info(f"Agent requested to terminate call: {reason}")
+            
+            # Save conversation to Firebase before terminating
+            await save_voice_conversation_to_firebase()
+            
+            # Terminate the call
+            await task.queue_frames([EndFrame()])
+            
+            # Mark session as disconnected
+            if caller_phone and caller_phone != "Unknown":
+                session = active_sessions.get(caller_phone)
+                if session:
+                    session["disconnected"] = True
+                    logger.info("Marked session as disconnected due to agent termination")
+            
+            # Clean up resources
+            await transport.cleanup()
+            
+            # Clean up stored caller info
+            if call_sid and call_sid in caller_info_storage:
+                del caller_info_storage[call_sid]
+                logger.info(f"Cleaned up caller info for terminated call: {call_sid}")
+            
+            # Clean up active session
+            if caller_phone and caller_phone in active_sessions:
+                del active_sessions[caller_phone]
+                logger.info(f"Deregistered active session for terminated call: {caller_phone}")
+            
+            await params.result_callback(f"✅ Call terminated successfully: {reason}")
+            
+        except Exception as e:
+            logger.error(f"Error in terminate call handler: {str(e)}")
+            await params.result_callback(f"❌ Error terminating call: {str(e)}")
+    
+    # Register the terminate call function handler
+    llm.register_function("terminate_voice_call", terminate_call_handler)
     tts = ElevenLabsTTSService(
         api_key=ELEVENLABS_API_KEY,
         voice_id=ELEVENLABS_VOICE_ID,
