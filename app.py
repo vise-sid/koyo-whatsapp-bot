@@ -762,21 +762,18 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             reason = params.arguments.get("reason", "call terminated")
             logger.info(f"Agent requested to terminate call: {reason}")
             
-            # Save conversation to Firebase before terminating
-            await save_voice_conversation_to_firebase()
-            
-            # Terminate the call
-            await task.queue_frames([EndFrame()])
-            
-            # Mark session as disconnected
+            # Mark session as disconnected FIRST to prevent further processing
             if caller_phone and caller_phone != "Unknown":
                 session = active_sessions.get(caller_phone)
                 if session:
                     session["disconnected"] = True
                     logger.info("Marked session as disconnected due to agent termination")
             
-            # Clean up resources
-            await transport.cleanup()
+            # Save conversation to Firebase before terminating
+            await save_voice_conversation_to_firebase()
+            
+            # Terminate the call pipeline
+            await task.queue_frames([EndFrame()])
             
             # Clean up stored caller info
             if call_sid and call_sid in caller_info_storage:
