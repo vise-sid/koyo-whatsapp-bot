@@ -757,17 +757,13 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             reason = params.arguments.get("reason", "agent initiated termination")
             logger.info(f"Agent requested to terminate call: {reason}")
             
-            # Save conversation to Firebase first
-            try:
-                await save_voice_conversation_to_firebase()
-                logger.info("Conversation saved to Firebase successfully")
-            except Exception as e:
-                logger.error(f"Failed to save conversation to Firebase: {e}")
-            
             # Use Pipecat's proper graceful termination from within the pipeline
-            # Push EndTaskFrame upstream to signal graceful termination
+            # Push EndTaskFrame upstream to signal graceful termination IMMEDIATELY
             await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
             logger.info("EndTaskFrame pushed upstream for graceful termination")
+            
+            # Save conversation to Firebase AFTER initiating termination (async, non-blocking)
+            asyncio.create_task(save_voice_conversation_to_firebase())
             
             await params.result_callback(f"✅ Call terminated successfully: {reason}")
             
@@ -1002,18 +998,39 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
                             "timestamp": datetime.now()  # We don't have exact timestamp from context
                         })
                 
-                # Save to Firebase
-                for msg in conversation_messages:
-                    await save_message_to_firebase(
-                        user_id=caller_phone,
-                        sender=msg["sender"],
-                        content=msg["content"],
-                        timestamp=msg["timestamp"],
-                        conversation_type="voice",
-                        call_sid=call_sid
-                    )
-                
-                logger.info(f"Saved {len(conversation_messages)} voice messages to Firebase for {caller_phone}")
+                # Use batch operations for much faster Firebase saving
+                if conversation_messages:
+                    logger.info(f"Batch saving {len(conversation_messages)} voice messages to Firebase for {caller_phone}")
+                    
+                    # Create batch for faster operations
+                    batch = db.batch()
+                    character_name = "meher"
+                    
+                    # Update conversation metadata once
+                    await create_or_update_conversation_metadata(caller_phone, character_name, call_sid)
+                    
+                    # Add all messages to batch
+                    conversation_ref = db.collection("users").document(caller_phone).collection("conversations").document(character_name)
+                    messages_ref = conversation_ref.collection("messages")
+                    
+                    for msg in conversation_messages:
+                        message_data = {
+                            "sender": msg["sender"],
+                            "content": msg["content"][:1000],
+                            "timestamp": msg["timestamp"],
+                            "sync": False,
+                            "conversation_type": "voice",
+                        }
+                        if call_sid:
+                            message_data["call_sid"] = call_sid
+                        
+                        # Add to batch
+                        new_message_ref = messages_ref.document()
+                        batch.set(new_message_ref, message_data)
+                    
+                    # Commit batch operation (much faster than individual saves)
+                    batch.commit()
+                    logger.info(f"Batch saved {len(conversation_messages)} voice messages to Firebase for {caller_phone}")
             except Exception as e:
                 logger.error(f"Failed to save voice conversation to Firebase: {e}")
 
