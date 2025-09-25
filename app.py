@@ -753,39 +753,16 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     async def terminate_call_handler(params: FunctionCallParams):
         """Handle voice call termination function calls"""
         try:
-            # Check if connection is still active
-            if hasattr(transport, '_websocket') and transport._websocket.client_state.name != 'CONNECTED':
-                logger.info("Connection already closed, cannot terminate call")
-                await params.result_callback("❌ Connection already closed")
-                return
-            
-            reason = params.arguments.get("reason", "call terminated")
+            reason = params.arguments.get("reason", "agent initiated termination")
             logger.info(f"Agent requested to terminate call: {reason}")
             
-            # Mark session as disconnected FIRST to prevent further processing
-            if caller_phone and caller_phone != "Unknown":
-                session = active_sessions.get(caller_phone)
-                if session:
-                    session["disconnected"] = True
-                    logger.info("Marked session as disconnected due to agent termination")
+            # Use the unified termination function
+            success = await unified_terminate_call(reason, save_conversation=True, force=False)
             
-            # Save conversation to Firebase before terminating
-            await save_voice_conversation_to_firebase()
-            
-            # Terminate the call pipeline
-            await task.queue_frames([EndFrame()])
-            
-            # Clean up stored caller info
-            if call_sid and call_sid in caller_info_storage:
-                del caller_info_storage[call_sid]
-                logger.info(f"Cleaned up caller info for terminated call: {call_sid}")
-            
-            # Clean up active session
-            if caller_phone and caller_phone in active_sessions:
-                del active_sessions[caller_phone]
-                logger.info(f"Deregistered active session for terminated call: {caller_phone}")
-            
-            await params.result_callback(f"✅ Call terminated successfully: {reason}")
+            if success:
+                await params.result_callback(f"✅ Call terminated successfully: {reason}")
+            else:
+                await params.result_callback(f"❌ Failed to terminate call: {reason}")
             
         except Exception as e:
             logger.error(f"Error in terminate call handler: {str(e)}")
@@ -893,46 +870,86 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         # Return True to continue monitoring for more idle events
         return True
 
+    async def unified_terminate_call(reason: str = "call terminated", save_conversation: bool = True, force: bool = False):
+        """
+        Unified call termination function that handles all termination scenarios consistently.
+        
+        Args:
+            reason: Reason for termination (for logging)
+            save_conversation: Whether to save conversation to Firebase
+            force: Force termination even if connection appears closed
+        """
+        logger.info(f"Unified call termination initiated: {reason}")
+        
+        try:
+            # Check if we have valid caller info
+            if not caller_phone or caller_phone == "Unknown":
+                logger.warning("No valid caller phone found for termination")
+                return False
+            
+            # Get the active session
+            session = active_sessions.get(caller_phone)
+            if not session:
+                logger.warning(f"No active session found for caller: {caller_phone}")
+                return False
+            
+            # Mark session as disconnected FIRST to prevent further processing
+            session["disconnected"] = True
+            logger.info(f"Marked session as disconnected for caller: {caller_phone}")
+            
+            # Check connection status (unless forcing)
+            if not force:
+                if hasattr(transport, '_websocket') and transport._websocket.client_state.name != 'CONNECTED':
+                    logger.info("Connection already closed, proceeding with cleanup only")
+                    save_conversation = False  # Don't try to save if connection is closed
+            
+            # Save conversation to Firebase if requested and possible
+            if save_conversation:
+                try:
+                    await save_voice_conversation_to_firebase()
+                    logger.info("Conversation saved to Firebase successfully")
+                except Exception as e:
+                    logger.error(f"Failed to save conversation to Firebase: {e}")
+            
+            # Terminate the pipeline task
+            try:
+                task = session.get("task")
+                if task:
+                    await task.queue_frames([EndFrame()])
+                    logger.info("EndFrame queued successfully")
+                    
+                    # Wait a moment for the frame to be processed
+                    await asyncio.sleep(0.5)
+                    
+                    # Try to cancel the task if it's still running
+                    if hasattr(task, 'cancel') and not task.done():
+                        task.cancel()
+                        logger.info("Task cancelled successfully")
+                else:
+                    logger.warning("No task found in session to terminate")
+            except Exception as e:
+                logger.error(f"Error terminating pipeline task: {e}")
+            
+            # Clean up stored caller info
+            if call_sid and call_sid in caller_info_storage:
+                del caller_info_storage[call_sid]
+                logger.info(f"Cleaned up caller info for terminated call: {call_sid}")
+            
+            # Clean up active session
+            if caller_phone in active_sessions:
+                del active_sessions[caller_phone]
+                logger.info(f"Deregistered active session for terminated call: {caller_phone}")
+            
+            logger.info(f"Call termination completed successfully: {reason}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in unified call termination: {e}")
+            return False
+
     async def terminate_call_after_goodbye():
         """Terminate the call after giving time for goodbye message to be spoken"""
-        logger.info("Terminating call due to user inactivity")
-        
-        # Check if connection is still active before proceeding
-        if hasattr(transport, '_websocket') and transport._websocket.client_state.name != 'CONNECTED':
-            logger.info("Connection already closed, skipping termination")
-            return
-        
-        await task.queue_frames([EndFrame()])
-        
-        # Wait for the bot to finish speaking before ending
-        max_wait_time = 20  # Maximum 20 seconds
-        wait_time = 0
-        while wait_time < max_wait_time:
-            # Check if connection is still active
-            if hasattr(transport, '_websocket') and transport._websocket.client_state.name != 'CONNECTED':
-                logger.info("Connection closed during termination, stopping")
-                break
-                
-            # Check if bot is still speaking
-            if hasattr(transport, '_bot_speaking') and not transport._bot_speaking:
-                logger.info("Bot finished speaking, proceeding to end call")
-                break
-            await asyncio.sleep(0.5)
-            wait_time += 0.5
-        
-        # Additional small delay to ensure audio finishes
-        await asyncio.sleep(2)
-        
-        # Save voice conversation to Firebase before cleanup
-        await save_voice_conversation_to_firebase()
-        
-        # Clean up transport
-        await transport.cleanup()
-        
-        # Clean up stored caller info
-        if call_sid and call_sid in caller_info_storage:
-            del caller_info_storage[call_sid]
-            logger.info(f"Cleaned up caller info for CallSid: {call_sid}")
+        await unified_terminate_call("user inactivity timeout", save_conversation=True, force=False)
 
     # Use the retry callback pattern - UserIdleProcessor handles reset automatically
     user_idle = UserIdleProcessor(
@@ -1055,57 +1072,11 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         """Handle client disconnection - save conversation and cleanup"""
         logger.info("Client disconnected, saving conversation and cleaning up")
         
-        # Save voice conversation to Firebase using LLM context
+        # Use unified termination for client disconnect
         if caller_phone and caller_phone != "Unknown":
-            # Mark session as disconnected to stop idle processing
-            session = active_sessions.get(caller_phone)
-            if session:
-                session["disconnected"] = True
-                logger.info("Marked session as disconnected in transport handler")
-            
-            try:
-                # Get messages from LLM context
-                messages = ctx.get_messages()
-                
-                # Filter out system messages and save user/assistant messages
-                conversation_messages = []
-                for msg in messages:
-                    role = msg.get("role")
-                    content = msg.get("content", "")
-                    
-                    if role in ["user", "assistant"] and content.strip():
-                        sender = "user" if role == "user" else "character"
-                        conversation_messages.append({
-                            "sender": sender,
-                            "content": content,
-                            "timestamp": datetime.now()
-                        })
-                
-                # Save to Firebase
-                if conversation_messages:
-                    logger.info(f"Saving {len(conversation_messages)} voice messages to Firebase for {caller_phone}")
-                    for msg in conversation_messages:
-                        await save_message_to_firebase(
-                            user_id=caller_phone,
-                            sender=msg["sender"],
-                            content=msg["content"],
-                            timestamp=msg["timestamp"],
-                            conversation_type="voice",
-                            call_sid=call_sid
-                        )
-                    logger.info(f"Successfully saved voice conversation to Firebase for {caller_phone}")
-            except Exception as e:
-                logger.error(f"Failed to save voice conversation on disconnect: {e}")
-        
-        # Clean up stored caller info
-        if call_sid and call_sid in caller_info_storage:
-            del caller_info_storage[call_sid]
-            logger.info(f"Cleaned up caller info on disconnect for CallSid: {call_sid}")
-        
-        # Clean up active session
-        if caller_phone and caller_phone in active_sessions:
-            del active_sessions[caller_phone]
-            logger.info(f"Deregistered active session for {caller_phone}")
+            await unified_terminate_call("client disconnected", save_conversation=True, force=True)
+        else:
+            logger.warning("No valid caller phone found for client disconnect cleanup")
 
     # Enhanced pipeline runner with better audio processing
     runner = PipelineRunner(
@@ -1155,81 +1126,17 @@ async def ws_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         logger.info("Twilio WebSocket disconnected")
         
-        # Save voice conversation to Firebase before cleanup
+        # Use unified termination for WebSocket disconnect
         try:
             if 'caller_number' in locals() and caller_number:
                 caller_phone = extract_phone_number(caller_number)
                 if caller_phone and caller_phone != "Unknown":
-                    # Get the session and save conversation using LLM context
-                    session = active_sessions.get(caller_phone)
-                    if session:
-                        # Mark session as disconnected to stop idle processing
-                        session["disconnected"] = True
-                        logger.info("Marked session as disconnected")
-                    
-                    if session and session.get("llm_context"):
-                        llm_ctx = session["llm_context"]
-                        
-                        # Get messages from LLM context
-                        messages = llm_ctx.get_messages()
-                        
-                        # Filter out system messages and save user/assistant messages
-                        conversation_messages = []
-                        for msg in messages:
-                            role = msg.get("role")
-                            content = msg.get("content", "")
-                            
-                            if role in ["user", "assistant"] and content.strip():
-                                sender = "user" if role == "user" else "character"
-                                conversation_messages.append({
-                                    "sender": sender,
-                                    "content": content,
-                                    "timestamp": datetime.now()
-                                })
-                        
-                        # Save to Firebase
-                        if conversation_messages:
-                            logger.info(f"Saving {len(conversation_messages)} voice messages to Firebase for {caller_phone}")
-                            for msg in conversation_messages:
-                                await save_message_to_firebase(
-                                    user_id=caller_phone,
-                                    sender=msg["sender"],
-                                    content=msg["content"],
-                                    timestamp=msg["timestamp"],
-                                    conversation_type="voice",
-                                    call_sid=call_sid
-                                )
-                            logger.info(f"Successfully saved voice conversation to Firebase for {caller_phone}")
-                    
-                    # Terminate the pipeline task to properly end the call
-                    if session and session.get("task"):
-                        logger.info("Terminating pipeline task due to WebSocket disconnect")
-                        try:
-                            # Force terminate the pipeline immediately
-                            task = session["task"]
-                            await task.queue_frames([EndFrame()])
-                            # Also try to cancel the task if it's still running
-                            if hasattr(task, 'cancel'):
-                                task.cancel()
-                        except Exception as term_e:
-                            logger.error(f"Error terminating pipeline: {term_e}")
+                    # Use unified termination with force=True since connection is already closed
+                    await unified_terminate_call("WebSocket disconnect", save_conversation=True, force=True)
+                else:
+                    logger.warning("No valid caller phone found for WebSocket disconnect cleanup")
         except Exception as e:
-            logger.error(f"Error handling voice conversation save on disconnect: {e}")
-        
-        # Clean up stored caller info on disconnect
-        if 'call_sid' in locals() and call_sid and call_sid in caller_info_storage:
-            del caller_info_storage[call_sid]
-            logger.info(f"Cleaned up caller info on disconnect for CallSid: {call_sid}")
-        
-        # Clean up active session
-        try:
-            if 'caller_number' in locals() and caller_number:
-                phone = extract_phone_number(caller_number)
-                if phone in active_sessions:
-                    del active_sessions[phone]
-                    logger.info(f"Deregistered active session for {phone}")
-        except Exception:
-            pass
+            logger.error(f"Error in WebSocket disconnect cleanup: {e}")
     except Exception as e:
         logger.exception("WS error: %s", e)
         # Clean up stored caller info on error
