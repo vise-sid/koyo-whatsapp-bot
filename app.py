@@ -24,7 +24,7 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.pipeline.runner import PipelineRunner
-from pipecat.frames.frames import LLMRunFrame, EndFrame, EndTaskFrame, LLMMessagesAppendFrame
+from pipecat.frames.frames import LLMRunFrame, EndFrame, LLMMessagesAppendFrame
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.processors.user_idle_processor import UserIdleProcessor
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
@@ -215,9 +215,22 @@ async def cleanup_old_caller_info():
             for call_sid in expired_entries:
                 del caller_info_storage[call_sid]
                 logger.info(f"Cleaned up expired caller info for CallSid: {call_sid}")
+            
+            # Also cleanup old disconnected active sessions
+            expired_sessions = []
+            for caller_phone, session in active_sessions.items():
+                if session.get("disconnected", False):
+                    # Remove disconnected sessions older than 1 hour
+                    disconnected_at = session.get("disconnected_at", current_time)
+                    if (current_time - disconnected_at).total_seconds() > 3600:
+                        expired_sessions.append(caller_phone)
+            
+            for caller_phone in expired_sessions:
+                del active_sessions[caller_phone]
+                logger.info(f"Cleaned up expired disconnected session for caller: {caller_phone}")
                 
-            if expired_entries:
-                logger.info(f"Cleaned up {len(expired_entries)} expired caller info entries")
+            if expired_entries or expired_sessions:
+                logger.info(f"Cleaned up {len(expired_entries)} caller info entries and {len(expired_sessions)} expired sessions")
                 
         except Exception as e:
             logger.error(f"Error during caller info cleanup: {e}")
@@ -413,7 +426,9 @@ def health(): return {"ok": True}
 @app.on_event("startup")
 async def startup_event():
     """Start background tasks when the app starts"""
-    asyncio.create_task(cleanup_old_caller_info())
+    # Create background task with proper error handling
+    cleanup_task = asyncio.create_task(cleanup_old_caller_info())
+    cleanup_task.add_done_callback(lambda t: logger.error(f"Cleanup task failed: {t.exception()}") if t.exception() else None)
     logger.info("Started caller info cleanup task")
     
     # Initialize Firebase
@@ -431,10 +446,16 @@ async def startup_event():
             firebase_admin.initialize_app()
         
         db = firestore.client()
-        logger.info("Firebase initialized successfully")
+        # Test Firebase connection
+        test_doc = db.collection("_health_check").document("test")
+        test_doc.set({"timestamp": datetime.now()}, merge=True)
+        test_doc.delete()
+        logger.info("Firebase initialized and tested successfully")
     except Exception as e:
         logger.error(f"Firebase initialization failed: {e}")
         db = None
+        # Don't crash the app, but log the critical error
+        logger.critical("Firebase is not available - message saving will fail")
 
 # ---- helpers ----
 def _ws_url(request: Request) -> str:
@@ -916,7 +937,8 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             
             # Schedule call termination after goodbye message
             logger.info("Maximum idle attempts reached. Terminating call after goodbye message.")
-            asyncio.create_task(terminate_call_after_goodbye())
+            terminate_task = asyncio.create_task(terminate_call_after_goodbye())
+            terminate_task.add_done_callback(lambda t: logger.error(f"Terminate call task failed: {t.exception()}") if t.exception() else None)
             
             # Return False to stop idle monitoring
             return False
@@ -953,6 +975,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             
             # Mark session as disconnected to prevent further processing
             session["disconnected"] = True
+            session["disconnected_at"] = datetime.now()
             logger.info(f"Marked session as disconnected for caller: {caller_phone}")
             
             # Save conversation to Firebase if requested
@@ -1166,11 +1189,14 @@ async def ws_endpoint(websocket: WebSocket):
                     if session:
                         # Mark as disconnected and save conversation asynchronously
                         session["disconnected"] = True
+                        session["disconnected_at"] = datetime.now()
                         llm_ctx = session.get("llm_context")
                         if llm_ctx:
                             conversation_messages = extract_conversation_messages(llm_ctx)
                             if conversation_messages:
-                                asyncio.create_task(save_voice_messages_to_firebase_batch(caller_phone, conversation_messages, call_sid))
+                                # Create task with proper error handling
+                                task = asyncio.create_task(save_voice_messages_to_firebase_batch(caller_phone, conversation_messages, call_sid))
+                                task.add_done_callback(lambda t: logger.error(f"Firebase save task failed: {t.exception()}") if t.exception() else None)
                         # Clean up session
                         del active_sessions[caller_phone]
                         logger.info(f"WebSocket disconnect cleanup completed for {caller_phone}")
