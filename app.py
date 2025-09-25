@@ -73,6 +73,47 @@ async def create_or_update_conversation_metadata(user_id: str, character_name: s
     except Exception as e:
         logger.error(f"Failed to update conversation metadata: {e}")
 
+async def save_voice_messages_to_firebase_batch(caller_phone: str, messages: list, call_sid: str = None):
+    """Global helper function to save voice messages to Firebase using batch operations"""
+    try:
+        if not messages:
+            return
+            
+        logger.info(f"Batch saving {len(messages)} voice messages to Firebase for {caller_phone}")
+        
+        # Create batch for faster operations
+        batch = db.batch()
+        character_name = "meher"
+        
+        # Update conversation metadata once
+        await create_or_update_conversation_metadata(caller_phone, character_name, call_sid)
+        
+        # Add all messages to batch
+        conversation_ref = db.collection("users").document(caller_phone).collection("conversations").document(character_name)
+        messages_ref = conversation_ref.collection("messages")
+        
+        for msg in messages:
+            message_data = {
+                "sender": msg["sender"],
+                "content": msg["content"][:1000],
+                "timestamp": msg["timestamp"],
+                "sync": False,
+                "conversation_type": "voice",
+            }
+            if call_sid:
+                message_data["call_sid"] = call_sid
+            
+            # Add to batch
+            new_message_ref = messages_ref.document()
+            batch.set(new_message_ref, message_data)
+        
+        # Commit batch operation (much faster than individual saves)
+        batch.commit()
+        logger.info(f"Batch saved {len(messages)} voice messages to Firebase for {caller_phone}")
+        
+    except Exception as e:
+        logger.error(f"Failed to batch save voice messages to Firebase: {e}")
+
 async def save_message_to_firebase(
     user_id: str, 
     sender: str, 
@@ -757,13 +798,46 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             reason = params.arguments.get("reason", "agent initiated termination")
             logger.info(f"Agent requested to terminate call: {reason}")
             
-            # Use Pipecat's proper graceful termination from within the pipeline
-            # Push EndTaskFrame upstream to signal graceful termination IMMEDIATELY
-            await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
-            logger.info("EndTaskFrame pushed upstream for graceful termination")
-            
-            # Save conversation to Firebase AFTER initiating termination (async, non-blocking)
-            asyncio.create_task(save_voice_conversation_to_firebase())
+            # Get the active session for proper termination
+            if caller_phone and caller_phone != "Unknown":
+                session = active_sessions.get(caller_phone)
+                if session:
+                    # Mark session as disconnected immediately
+                    session["disconnected"] = True
+                    logger.info(f"Marked session as disconnected for caller: {caller_phone}")
+                    
+                    # Use immediate termination for function calls (faster response)
+                    task = session.get("task")
+                    if task:
+                        # Queue EndFrame for immediate termination
+                        await task.queue_frames([EndFrame()])
+                        logger.info("EndFrame queued for immediate termination")
+                    
+                    # Save conversation to Firebase asynchronously (non-blocking)
+                    # Get messages from context and save using global helper
+                    try:
+                        llm_ctx = session.get("llm_context")
+                        if llm_ctx:
+                            messages = llm_ctx.get_messages()
+                            conversation_messages = []
+                            for msg in messages:
+                                role = msg.get("role")
+                                content = msg.get("content", "")
+                                if role in ["user", "assistant"] and content.strip():
+                                    sender = "user" if role == "user" else "character"
+                                    conversation_messages.append({
+                                        "sender": sender,
+                                        "content": content,
+                                        "timestamp": datetime.now()
+                                    })
+                            if conversation_messages:
+                                asyncio.create_task(save_voice_messages_to_firebase_batch(caller_phone, conversation_messages, call_sid))
+                    except Exception as save_e:
+                        logger.error(f"Failed to queue Firebase save: {save_e}")
+                else:
+                    logger.warning(f"No active session found for caller: {caller_phone}")
+            else:
+                logger.warning("No valid caller phone found for termination")
             
             await params.result_callback(f"✅ Call terminated successfully: {reason}")
             
@@ -1029,6 +1103,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
                         batch.set(new_message_ref, message_data)
                     
                     # Commit batch operation (much faster than individual saves)
+                    # Note: batch.commit() is synchronous, not async
                     batch.commit()
                     logger.info(f"Batch saved {len(conversation_messages)} voice messages to Firebase for {caller_phone}")
             except Exception as e:
@@ -1192,13 +1267,51 @@ async def ws_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         logger.info("Twilio WebSocket disconnected")
         
-        # Use immediate termination for WebSocket disconnect (connection already closed)
+        # Clean up on WebSocket disconnect (connection already closed)
         try:
             if 'caller_number' in locals() and caller_number:
                 caller_phone = extract_phone_number(caller_number)
                 if caller_phone and caller_phone != "Unknown":
-                    # Use immediate termination since connection is already closed
-                    await immediate_terminate_call("WebSocket disconnect", save_conversation=True)
+                    # Get the active session and clean up
+                    session = active_sessions.get(caller_phone)
+                    if session:
+                        # Mark session as disconnected
+                        session["disconnected"] = True
+                        logger.info(f"Marked session as disconnected for caller: {caller_phone}")
+                        
+                        # Save conversation to Firebase asynchronously
+                        try:
+                            # Get messages from the LLM context
+                            llm_ctx = session.get("llm_context")
+                            if llm_ctx:
+                                messages = llm_ctx.get_messages()
+                                
+                                # Filter and save messages
+                                conversation_messages = []
+                                for msg in messages:
+                                    role = msg.get("role")
+                                    content = msg.get("content", "")
+                                    
+                                    if role in ["user", "assistant"] and content.strip():
+                                        sender = "user" if role == "user" else "character"
+                                        conversation_messages.append({
+                                            "sender": sender,
+                                            "content": content,
+                                            "timestamp": datetime.now()
+                                        })
+                                
+                                # Save to Firebase asynchronously
+                                if conversation_messages:
+                                    asyncio.create_task(save_voice_messages_to_firebase_batch(caller_phone, conversation_messages, call_sid))
+                                    logger.info(f"Queued {len(conversation_messages)} voice messages for Firebase save")
+                        except Exception as save_e:
+                            logger.error(f"Failed to queue Firebase save: {save_e}")
+                        
+                        # Clean up the session
+                        del active_sessions[caller_phone]
+                        logger.info(f"Deregistered active session for completed call: {caller_phone}")
+                    else:
+                        logger.warning(f"No active session found for caller: {caller_phone}")
                 else:
                     logger.warning("No valid caller phone found for WebSocket disconnect cleanup")
         except Exception as e:
