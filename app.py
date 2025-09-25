@@ -881,33 +881,25 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         """Save all voice conversation messages to Firebase using context aggregator"""
         if caller_phone and caller_phone != "Unknown":
             try:
-                # Get all messages from the context aggregator
-                user_messages = agg.user().get_messages()
-                assistant_messages = agg.assistant().get_messages()
+                # Get messages from the LLM context
+                messages = ctx.get_messages()
                 
-                # Combine and save all messages
-                all_messages = []
-                
-                # Add user messages
-                for msg in user_messages:
-                    if msg.get("role") == "user" and msg.get("content"):
-                        all_messages.append({
-                            "sender": "user",
-                            "content": msg["content"],
-                            "timestamp": datetime.now()  # We don't have exact timestamp from aggregator
-                        })
-                
-                # Add assistant messages
-                for msg in assistant_messages:
-                    if msg.get("role") == "assistant" and msg.get("content"):
-                        all_messages.append({
-                            "sender": "character", 
-                            "content": msg["content"],
-                            "timestamp": datetime.now()  # We don't have exact timestamp from aggregator
+                # Filter out system messages and save user/assistant messages
+                conversation_messages = []
+                for msg in messages:
+                    role = msg.get("role")
+                    content = msg.get("content", "")
+                    
+                    if role in ["user", "assistant"] and content.strip():
+                        sender = "user" if role == "user" else "character"
+                        conversation_messages.append({
+                            "sender": sender,
+                            "content": content,
+                            "timestamp": datetime.now()  # We don't have exact timestamp from context
                         })
                 
                 # Save to Firebase
-                for msg in all_messages:
+                for msg in conversation_messages:
                     await save_message_to_firebase(
                         user_id=caller_phone,
                         sender=msg["sender"],
@@ -917,7 +909,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
                         call_sid=call_sid
                     )
                 
-                logger.info(f"Saved {len(all_messages)} voice messages to Firebase for {caller_phone}")
+                logger.info(f"Saved {len(conversation_messages)} voice messages to Firebase for {caller_phone}")
             except Exception as e:
                 logger.error(f"Failed to save voice conversation to Firebase: {e}")
 
@@ -953,7 +945,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
                 "task": task,
                 "transport": transport,
                 "display_name": caller_display_name,
-                "context_aggregator": agg,  # Store the context aggregator for message access
+                "llm_context": ctx,  # Store the LLM context for message access
             }
             logger.info(f"Registered active session for {caller_phone}")
     except Exception:
@@ -997,38 +989,30 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         """Handle client disconnection - save conversation and cleanup"""
         logger.info("Client disconnected, saving conversation and cleaning up")
         
-        # Save voice conversation to Firebase using context aggregator
+        # Save voice conversation to Firebase using LLM context
         if caller_phone and caller_phone != "Unknown":
             try:
-                # Get messages from context aggregator
-                user_messages = agg.user().get_messages()
-                assistant_messages = agg.assistant().get_messages()
+                # Get messages from LLM context
+                messages = ctx.get_messages()
                 
-                # Combine and save all messages
-                all_messages = []
-                
-                # Add user messages
-                for msg in user_messages:
-                    if msg.get("role") == "user" and msg.get("content"):
-                        all_messages.append({
-                            "sender": "user",
-                            "content": msg["content"],
-                            "timestamp": datetime.now()
-                        })
-                
-                # Add assistant messages
-                for msg in assistant_messages:
-                    if msg.get("role") == "assistant" and msg.get("content"):
-                        all_messages.append({
-                            "sender": "character", 
-                            "content": msg["content"],
+                # Filter out system messages and save user/assistant messages
+                conversation_messages = []
+                for msg in messages:
+                    role = msg.get("role")
+                    content = msg.get("content", "")
+                    
+                    if role in ["user", "assistant"] and content.strip():
+                        sender = "user" if role == "user" else "character"
+                        conversation_messages.append({
+                            "sender": sender,
+                            "content": content,
                             "timestamp": datetime.now()
                         })
                 
                 # Save to Firebase
-                if all_messages:
-                    logger.info(f"Saving {len(all_messages)} voice messages to Firebase for {caller_phone}")
-                    for msg in all_messages:
+                if conversation_messages:
+                    logger.info(f"Saving {len(conversation_messages)} voice messages to Firebase for {caller_phone}")
+                    for msg in conversation_messages:
                         await save_message_to_firebase(
                             user_id=caller_phone,
                             sender=msg["sender"],
@@ -1104,40 +1088,32 @@ async def ws_endpoint(websocket: WebSocket):
             if 'caller_number' in locals() and caller_number:
                 caller_phone = extract_phone_number(caller_number)
                 if caller_phone and caller_phone != "Unknown":
-                    # Get the session and save conversation using context aggregator
+                    # Get the session and save conversation using LLM context
                     session = active_sessions.get(caller_phone)
-                    if session and session.get("context_aggregator"):
-                        agg = session["context_aggregator"]
+                    if session and session.get("llm_context"):
+                        llm_ctx = session["llm_context"]
                         
-                        # Get messages from context aggregator
-                        user_messages = agg.user().get_messages()
-                        assistant_messages = agg.assistant().get_messages()
+                        # Get messages from LLM context
+                        messages = llm_ctx.get_messages()
                         
-                        # Combine and save all messages
-                        all_messages = []
-                        
-                        # Add user messages
-                        for msg in user_messages:
-                            if msg.get("role") == "user" and msg.get("content"):
-                                all_messages.append({
-                                    "sender": "user",
-                                    "content": msg["content"],
-                                    "timestamp": datetime.now()
-                                })
-                        
-                        # Add assistant messages
-                        for msg in assistant_messages:
-                            if msg.get("role") == "assistant" and msg.get("content"):
-                                all_messages.append({
-                                    "sender": "character", 
-                                    "content": msg["content"],
+                        # Filter out system messages and save user/assistant messages
+                        conversation_messages = []
+                        for msg in messages:
+                            role = msg.get("role")
+                            content = msg.get("content", "")
+                            
+                            if role in ["user", "assistant"] and content.strip():
+                                sender = "user" if role == "user" else "character"
+                                conversation_messages.append({
+                                    "sender": sender,
+                                    "content": content,
                                     "timestamp": datetime.now()
                                 })
                         
                         # Save to Firebase
-                        if all_messages:
-                            logger.info(f"Saving {len(all_messages)} voice messages to Firebase for {caller_phone}")
-                            for msg in all_messages:
+                        if conversation_messages:
+                            logger.info(f"Saving {len(conversation_messages)} voice messages to Firebase for {caller_phone}")
+                            for msg in conversation_messages:
                                 await save_message_to_firebase(
                                     user_id=caller_phone,
                                     sender=msg["sender"],
