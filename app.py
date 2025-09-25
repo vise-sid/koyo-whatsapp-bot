@@ -24,7 +24,8 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.pipeline.runner import PipelineRunner
-from pipecat.frames.frames import LLMRunFrame, EndFrame, LLMMessagesAppendFrame
+from pipecat.frames.frames import LLMRunFrame, EndFrame, EndTaskFrame, LLMMessagesAppendFrame
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.processors.user_idle_processor import UserIdleProcessor
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.openai.llm import OpenAILLMService
@@ -751,18 +752,24 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
     
     # Register call termination function handler
     async def terminate_call_handler(params: FunctionCallParams):
-        """Handle voice call termination function calls"""
+        """Handle voice call termination function calls using Pipecat best practices"""
         try:
             reason = params.arguments.get("reason", "agent initiated termination")
             logger.info(f"Agent requested to terminate call: {reason}")
             
-            # Use the unified termination function
-            success = await unified_terminate_call(reason, save_conversation=True, force=False)
+            # Save conversation to Firebase first
+            try:
+                await save_voice_conversation_to_firebase()
+                logger.info("Conversation saved to Firebase successfully")
+            except Exception as e:
+                logger.error(f"Failed to save conversation to Firebase: {e}")
             
-            if success:
-                await params.result_callback(f"✅ Call terminated successfully: {reason}")
-            else:
-                await params.result_callback(f"❌ Failed to terminate call: {reason}")
+            # Use Pipecat's proper graceful termination from within the pipeline
+            # Push EndTaskFrame upstream to signal graceful termination
+            await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+            logger.info("EndTaskFrame pushed upstream for graceful termination")
+            
+            await params.result_callback(f"✅ Call terminated successfully: {reason}")
             
         except Exception as e:
             logger.error(f"Error in terminate call handler: {str(e)}")
@@ -870,16 +877,12 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         # Return True to continue monitoring for more idle events
         return True
 
-    async def unified_terminate_call(reason: str = "call terminated", save_conversation: bool = True, force: bool = False):
+    async def graceful_terminate_call(reason: str = "call terminated", save_conversation: bool = True):
         """
-        Unified call termination function that handles all termination scenarios consistently.
-        
-        Args:
-            reason: Reason for termination (for logging)
-            save_conversation: Whether to save conversation to Firebase
-            force: Force termination even if connection appears closed
+        Graceful termination following Pipecat best practices.
+        Allows bot to complete current processing before shutdown.
         """
-        logger.info(f"Unified call termination initiated: {reason}")
+        logger.info(f"Graceful call termination initiated: {reason}")
         
         try:
             # Check if we have valid caller info
@@ -893,17 +896,11 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
                 logger.warning(f"No active session found for caller: {caller_phone}")
                 return False
             
-            # Mark session as disconnected FIRST to prevent further processing
+            # Mark session as disconnected to prevent further processing
             session["disconnected"] = True
             logger.info(f"Marked session as disconnected for caller: {caller_phone}")
             
-            # Check connection status (unless forcing)
-            if not force:
-                if hasattr(transport, '_websocket') and transport._websocket.client_state.name != 'CONNECTED':
-                    logger.info("Connection already closed, proceeding with cleanup only")
-                    save_conversation = False  # Don't try to save if connection is closed
-            
-            # Save conversation to Firebase if requested and possible
+            # Save conversation to Firebase if requested
             if save_conversation:
                 try:
                     await save_voice_conversation_to_firebase()
@@ -911,45 +908,70 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
                 except Exception as e:
                     logger.error(f"Failed to save conversation to Firebase: {e}")
             
-            # Terminate the pipeline task
-            try:
-                task = session.get("task")
-                if task:
-                    await task.queue_frames([EndFrame()])
-                    logger.info("EndFrame queued successfully")
-                    
-                    # Wait a moment for the frame to be processed
-                    await asyncio.sleep(0.5)
-                    
-                    # Try to cancel the task if it's still running
-                    if hasattr(task, 'cancel') and not task.done():
-                        task.cancel()
-                        logger.info("Task cancelled successfully")
-                else:
-                    logger.warning("No task found in session to terminate")
-            except Exception as e:
-                logger.error(f"Error terminating pipeline task: {e}")
+            # Use Pipecat's proper graceful termination
+            task = session.get("task")
+            if task:
+                # Queue EndFrame for graceful shutdown after pending frames
+                await task.queue_frames([EndFrame()])
+                logger.info("EndFrame queued for graceful termination")
+            else:
+                logger.warning("No task found in session to terminate")
             
-            # Clean up stored caller info
-            if call_sid and call_sid in caller_info_storage:
-                del caller_info_storage[call_sid]
-                logger.info(f"Cleaned up caller info for terminated call: {call_sid}")
-            
-            # Clean up active session
-            if caller_phone in active_sessions:
-                del active_sessions[caller_phone]
-                logger.info(f"Deregistered active session for terminated call: {caller_phone}")
-            
-            logger.info(f"Call termination completed successfully: {reason}")
             return True
             
         except Exception as e:
-            logger.error(f"Error in unified call termination: {e}")
+            logger.error(f"Error in graceful call termination: {e}")
+            return False
+
+    async def immediate_terminate_call(reason: str = "call terminated", save_conversation: bool = True):
+        """
+        Immediate termination following Pipecat best practices.
+        Cancels pipeline without waiting for pending frames.
+        """
+        logger.info(f"Immediate call termination initiated: {reason}")
+        
+        try:
+            # Check if we have valid caller info
+            if not caller_phone or caller_phone == "Unknown":
+                logger.warning("No valid caller phone found for termination")
+                return False
+            
+            # Get the active session
+            session = active_sessions.get(caller_phone)
+            if not session:
+                logger.warning(f"No active session found for caller: {caller_phone}")
+                return False
+            
+            # Mark session as disconnected to prevent further processing
+            session["disconnected"] = True
+            logger.info(f"Marked session as disconnected for caller: {caller_phone}")
+            
+            # Save conversation to Firebase if requested
+            if save_conversation:
+                try:
+                    await save_voice_conversation_to_firebase()
+                    logger.info("Conversation saved to Firebase successfully")
+                except Exception as e:
+                    logger.error(f"Failed to save conversation to Firebase: {e}")
+            
+            # Use Pipecat's proper immediate termination
+            task = session.get("task")
+            if task:
+                # Cancel task immediately - pushes CancelFrame downstream
+                await task.cancel()
+                logger.info("Task cancelled for immediate termination")
+            else:
+                logger.warning("No task found in session to terminate")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in immediate call termination: {e}")
             return False
 
     async def terminate_call_after_goodbye():
         """Terminate the call after giving time for goodbye message to be spoken"""
-        await unified_terminate_call("user inactivity timeout", save_conversation=True, force=False)
+        await graceful_terminate_call("user inactivity timeout", save_conversation=True)
 
     # Use the retry callback pattern - UserIdleProcessor handles reset automatically
     user_idle = UserIdleProcessor(
@@ -1072,9 +1094,9 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         """Handle client disconnection - save conversation and cleanup"""
         logger.info("Client disconnected, saving conversation and cleaning up")
         
-        # Use unified termination for client disconnect
+        # Use immediate termination for client disconnect (connection already closed)
         if caller_phone and caller_phone != "Unknown":
-            await unified_terminate_call("client disconnected", save_conversation=True, force=True)
+            await immediate_terminate_call("client disconnected", save_conversation=True)
         else:
             logger.warning("No valid caller phone found for client disconnect cleanup")
 
@@ -1083,7 +1105,34 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         handle_sigint=False, 
         force_gc=True,
     )
-    await runner.run(task)
+    
+    # Add proper cleanup handlers following Pipecat best practices
+    async def cleanup_on_pipeline_end():
+        """Clean up resources when pipeline ends naturally"""
+        try:
+            if caller_phone and caller_phone != "Unknown":
+                # Clean up stored caller info
+                if call_sid and call_sid in caller_info_storage:
+                    del caller_info_storage[call_sid]
+                    logger.info(f"Cleaned up caller info for completed call: {call_sid}")
+                
+                # Clean up active session
+                if caller_phone in active_sessions:
+                    del active_sessions[caller_phone]
+                    logger.info(f"Deregistered active session for completed call: {caller_phone}")
+                
+                logger.info(f"Pipeline cleanup completed for caller: {caller_phone}")
+        except Exception as e:
+            logger.error(f"Error in pipeline cleanup: {e}")
+    try:
+        await runner.run(task)
+    except Exception as e:
+        logger.error(f"Pipeline error: {e}")
+        # Ensure cleanup happens even on errors
+        await cleanup_on_pipeline_end()
+    finally:
+        # Always clean up when pipeline ends
+        await cleanup_on_pipeline_end()
 
 # ---- WebSocket endpoint for Media Streams ----
 @app.websocket("/ws")
@@ -1126,13 +1175,13 @@ async def ws_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         logger.info("Twilio WebSocket disconnected")
         
-        # Use unified termination for WebSocket disconnect
+        # Use immediate termination for WebSocket disconnect (connection already closed)
         try:
             if 'caller_number' in locals() and caller_number:
                 caller_phone = extract_phone_number(caller_number)
                 if caller_phone and caller_phone != "Unknown":
-                    # Use unified termination with force=True since connection is already closed
-                    await unified_terminate_call("WebSocket disconnect", save_conversation=True, force=True)
+                    # Use immediate termination since connection is already closed
+                    await immediate_terminate_call("WebSocket disconnect", save_conversation=True)
                 else:
                     logger.warning("No valid caller phone found for WebSocket disconnect cleanup")
         except Exception as e:
