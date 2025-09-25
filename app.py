@@ -781,6 +781,13 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
             logger.info("Connection closed, stopping idle monitoring")
             return False
         
+        # Check if the session has been marked as disconnected
+        if caller_phone and caller_phone != "Unknown":
+            session = active_sessions.get(caller_phone)
+            if session and session.get("disconnected"):
+                logger.info("Session marked as disconnected, stopping idle monitoring")
+                return False
+        
         # Update timeout for next retry
         next_timeout = get_timeout_for_retry(retry_count + 1)
         user_idle._timeout = next_timeout
@@ -946,6 +953,7 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
                 "transport": transport,
                 "display_name": caller_display_name,
                 "llm_context": ctx,  # Store the LLM context for message access
+                "disconnected": False,  # Flag to track disconnection
             }
             logger.info(f"Registered active session for {caller_phone}")
     except Exception:
@@ -991,6 +999,12 @@ async def _run_call(websocket: WebSocket, stream_sid: str, call_sid: Optional[st
         
         # Save voice conversation to Firebase using LLM context
         if caller_phone and caller_phone != "Unknown":
+            # Mark session as disconnected to stop idle processing
+            session = active_sessions.get(caller_phone)
+            if session:
+                session["disconnected"] = True
+                logger.info("Marked session as disconnected in transport handler")
+            
             try:
                 # Get messages from LLM context
                 messages = ctx.get_messages()
@@ -1090,6 +1104,11 @@ async def ws_endpoint(websocket: WebSocket):
                 if caller_phone and caller_phone != "Unknown":
                     # Get the session and save conversation using LLM context
                     session = active_sessions.get(caller_phone)
+                    if session:
+                        # Mark session as disconnected to stop idle processing
+                        session["disconnected"] = True
+                        logger.info("Marked session as disconnected")
+                    
                     if session and session.get("llm_context"):
                         llm_ctx = session["llm_context"]
                         
@@ -1127,7 +1146,15 @@ async def ws_endpoint(websocket: WebSocket):
                     # Terminate the pipeline task to properly end the call
                     if session and session.get("task"):
                         logger.info("Terminating pipeline task due to WebSocket disconnect")
-                        await session["task"].queue_frames([EndFrame()])
+                        try:
+                            # Force terminate the pipeline immediately
+                            task = session["task"]
+                            await task.queue_frames([EndFrame()])
+                            # Also try to cancel the task if it's still running
+                            if hasattr(task, 'cancel'):
+                                task.cancel()
+                        except Exception as term_e:
+                            logger.error(f"Error terminating pipeline: {term_e}")
         except Exception as e:
             logger.error(f"Error handling voice conversation save on disconnect: {e}")
         
