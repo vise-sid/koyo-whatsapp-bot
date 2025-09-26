@@ -47,7 +47,7 @@ class WhatsAppHandler:
         self.validate_signature = validate_signature
         self.logger = logging.getLogger(__name__)
     
-    async def handle_webhook(self, request: Request, active_sessions: Dict[str, Any]) -> Response:
+    async def handle_webhook(self, request: Request, active_sessions: Dict[str, Any], offcall_context: Dict[str, Any] = None) -> Response:
         """
         Handle inbound WhatsApp messages.
         
@@ -107,7 +107,7 @@ class WhatsAppHandler:
                 return Response(status_code=204)
 
             # No live session -> off-call LLM chat with context and reply over WhatsApp (freeform)
-            reply_text = await self._handle_multimodal_offcall(text_body, media_items, from_num)
+            reply_text = await self._handle_multimodal_offcall(text_body, media_items, from_num, offcall_context)
             
             # Send reply via WhatsApp (this would need to be injected as dependency)
             # For now, we'll return the reply text to be sent by the main handler
@@ -176,7 +176,7 @@ class WhatsAppHandler:
 
         return (" ".join(parts)).strip() or "[empty message]"
     
-    async def _handle_multimodal_offcall(self, text: str, media: List[Dict[str, str]], user_phone: str) -> str:
+    async def _handle_multimodal_offcall(self, text: str, media: List[Dict[str, str]], user_phone: str, offcall_context: Dict[str, Any] = None) -> str:
         """
         Off-call handler: build/maintain chat context and generate a Meher-style reply via LLM.
 
@@ -192,14 +192,12 @@ class WhatsAppHandler:
         Returns:
             Generated reply text
         """
-        # Import here to avoid circular imports
-        # Note: offcall_context should be passed as parameter in real implementation
-        from app_clean import offcall_context  # Temporary fix
-        
         # 1) Build user turn with media summary
         user_text = await self._process_media_content(text, media, user_phone, is_in_call=False)
 
         # 2) Prepare context store for user
+        if offcall_context is None:
+            offcall_context = {}
         history = offcall_context.get(user_phone) or []
 
         # 3) System prompt for off-call chat: use dedicated texting prompt module

@@ -150,7 +150,7 @@ async def whatsapp_webhook(request: Request) -> Response:
     """
     try:
         # Handle the webhook using our modular handler
-        result = await whatsapp_handler.handle_webhook(request, active_sessions)
+        result = await whatsapp_handler.handle_webhook(request, active_sessions, offcall_context)
         
         # If it's a dict with reply_text, send the reply
         if isinstance(result, dict) and "reply_text" in result:
