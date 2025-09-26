@@ -323,8 +323,11 @@ class VoiceSessionManager:
                 reason = params.arguments.get("reason", "agent initiated termination")
                 self.logger.info(f"Agent requested to terminate call: {reason}")
                 
+                # Extract caller phone properly
+                caller_phone = caller_number.replace("whatsapp:", "") if caller_number else "Unknown"
+                
                 success = await self._terminate_call(
-                    reason, caller_number, call_sid, active_sessions, caller_info_storage,
+                    reason, caller_phone, call_sid, active_sessions, caller_info_storage,
                     save_conversation=True, immediate=True
                 )
                 
@@ -412,13 +415,17 @@ class VoiceSessionManager:
     ) -> bool:
         """Unified call termination function"""
         self.logger.info(f"Call termination initiated: {reason}")
+        self.logger.info(f"Caller phone: {caller_phone}, Call SID: {call_sid}")
+        self.logger.info(f"Active sessions keys: {list(active_sessions.keys())}")
         
         try:
             if not caller_phone or caller_phone == "Unknown":
+                self.logger.warning(f"Invalid caller phone: {caller_phone}")
                 return False
             
             session = active_sessions.get(caller_phone)
             if not session:
+                self.logger.warning(f"No active session found for caller: {caller_phone}")
                 return False
             
             # Mark session as disconnected
