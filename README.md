@@ -9,7 +9,6 @@ The codebase has been refactored into a clean, modular architecture:
 ```
 koyo_v9/
 ├── app.py                          # Main FastAPI application
-├── app_original.py                 # Original monolithic app.py (backup)
 ├── requirements.txt                # Python dependencies
 ├── render.yaml                     # Deployment configuration
 ├── prompts/                        # AI prompt templates
