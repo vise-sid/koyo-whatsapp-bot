@@ -187,8 +187,8 @@ class VoiceSessionManager:
 
         # Setup user idle handling
         user_idle = UserIdleProcessor(
-            callback=lambda retry_count: self._handle_user_idle_with_retry(
-                retry_count, caller_phone, active_sessions
+            callback=lambda processor, retry_count: self._handle_user_idle_with_retry(
+                processor, retry_count, caller_phone, active_sessions
             ),
             timeout=get_timeout_for_retry(1)
         )
@@ -359,9 +359,10 @@ class VoiceSessionManager:
         llm.register_function("terminate_voice_call", terminate_call_handler)
     
     async def _handle_user_idle_with_retry(
-        self, 
-        retry_count: int, 
-        caller_phone: str, 
+        self,
+        processor,
+        retry_count: int,
+        caller_phone: str,
         active_sessions: Dict[str, Any]
     ) -> bool:
         """Handle user idle with structured follow-up based on retry count"""
@@ -392,34 +393,35 @@ class VoiceSessionManager:
                 "content": "The user has been silent multiple times. As Meher, gently check if they are still there and if everything is okay. Be caring, understanding, but maintain your bold personality. Use Devanagari script for Hindi."
             }
         else:  # retry_count >= 4
+            # Check if already terminating to prevent multiple triggers
+            if session.get("terminating", False):
+                self.logger.info("Already terminating, skipping duplicate idle handler")
+                return False
+                
+            # Mark as terminating to prevent multiple triggers
+            session["terminating"] = True
+            
             # Use simple EndTaskFrame approach for idle timeout
-            task = session.get("task")
-            if task:
-                try:
-                    # Save conversation before terminating
-                    caller_phone = caller_number.replace("whatsapp:", "") if caller_number else "Unknown"
-                    if caller_phone != "Unknown" and caller_phone in active_sessions:
-                        session = active_sessions[caller_phone]
-                        llm_ctx = session.get("llm_context")
-                        if llm_ctx:
-                            conversation_messages = firebase_service.extract_conversation_messages(llm_ctx)
-                            if conversation_messages:
-                                await firebase_service.save_voice_messages_to_firebase_batch(
-                                    caller_phone, conversation_messages, session.get("call_sid")
-                                )
-                                self.logger.info("Conversation saved to Firebase before idle timeout termination")
-                except Exception as e:
-                    self.logger.error(f"Failed to save conversation before idle timeout: {e}")
-                
-                # Use EndTaskFrame for clean termination
-                from pipecat.frames.frames import EndTaskFrame, TTSSpeakFrame
-                from pipecat.processors.frame_processor import FrameDirection
-                
-                # Say goodbye first
-                await task.queue_frames([TTSSpeakFrame("Thanks for the chat! Talk to you soon!")])
-                
-                # Signal that the task should end
-                await task.queue_frames([EndTaskFrame()])
+            try:
+                # Save conversation before terminating
+                llm_ctx = session.get("llm_context")
+                if llm_ctx:
+                    conversation_messages = firebase_service.extract_conversation_messages(llm_ctx)
+                    if conversation_messages:
+                        await firebase_service.save_voice_messages_to_firebase_batch(
+                            caller_phone, conversation_messages, session.get("call_sid")
+                        )
+                        self.logger.info("Conversation saved to Firebase before idle timeout termination")
+            except Exception as e:
+                self.logger.error(f"Failed to save conversation before idle timeout: {e}")
+            
+            # Use EndTaskFrame for clean termination
+            from pipecat.frames.frames import EndTaskFrame, TTSSpeakFrame
+            from pipecat.processors.frame_processor import FrameDirection
+            
+            # Say goodbye first, then end
+            await processor.push_frame(TTSSpeakFrame("Thanks for the chat! Talk to you soon!"))
+            await processor.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
             
             return False
         
