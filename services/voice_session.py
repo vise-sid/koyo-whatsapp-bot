@@ -318,23 +318,38 @@ class VoiceSessionManager:
                 await params.result_callback(f"❌ Error sending WhatsApp message: {str(e)}")
         
         async def terminate_call_handler(params: FunctionCallParams):
-            """Handle voice call termination function calls"""
+            """Handle voice call termination function calls using EndTaskFrame"""
             try:
                 reason = params.arguments.get("reason", "agent initiated termination")
                 self.logger.info(f"Agent requested to terminate call: {reason}")
                 
-                # Extract caller phone properly
-                caller_phone = caller_number.replace("whatsapp:", "") if caller_number else "Unknown"
+                # Save conversation before terminating
+                try:
+                    caller_phone = caller_number.replace("whatsapp:", "") if caller_number else "Unknown"
+                    if caller_phone != "Unknown" and caller_phone in active_sessions:
+                        session = active_sessions[caller_phone]
+                        llm_ctx = session.get("llm_context")
+                        if llm_ctx:
+                            conversation_messages = firebase_service.extract_conversation_messages(llm_ctx)
+                            if conversation_messages:
+                                await firebase_service.save_voice_messages_to_firebase_batch(
+                                    caller_phone, conversation_messages, call_sid
+                                )
+                                self.logger.info("Conversation saved to Firebase before termination")
+                except Exception as e:
+                    self.logger.error(f"Failed to save conversation before termination: {e}")
                 
-                success = await self._terminate_call(
-                    reason, caller_phone, call_sid, active_sessions, caller_info_storage,
-                    save_conversation=True, immediate=True
-                )
+                # Use simple EndTaskFrame approach
+                from pipecat.frames.frames import EndTaskFrame, TTSSpeakFrame
+                from pipecat.processors.frame_processor import FrameDirection
                 
-                if success:
-                    await params.result_callback(f"✅ Call terminated successfully: {reason}")
-                else:
-                    await params.result_callback(f"❌ Failed to terminate call: {reason}")
+                # Say goodbye first
+                await params.llm.push_frame(TTSSpeakFrame("Have a nice day! Talk to you soon!"))
+                
+                # Signal that the task should end after processing this frame
+                await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+                
+                await params.result_callback(f"✅ Call termination initiated: {reason}")
                 
             except Exception as e:
                 self.logger.error(f"Error in terminate call handler: {str(e)}")
@@ -377,21 +392,34 @@ class VoiceSessionManager:
                 "content": "The user has been silent multiple times. As Meher, gently check if they are still there and if everything is okay. Be caring, understanding, but maintain your bold personality. Use Devanagari script for Hindi."
             }
         else:  # retry_count >= 4
-            idle_message = {
-                "role": "user",
-                "content": "The user has been unresponsive for too long. As Meher, say a gentle goodbye message with your characteristic boldness and warmth, expressing that you hope to talk again soon. After this message, the call will end. Use Devanagari script for Hindi."
-            }
-            
-            # Send goodbye and terminate
+            # Use simple EndTaskFrame approach for idle timeout
             task = session.get("task")
             if task:
-                messages_for_llm = LLMMessagesAppendFrame([idle_message])
-                await task.queue_frames([messages_for_llm, LLMRunFrame()])
+                try:
+                    # Save conversation before terminating
+                    caller_phone = caller_number.replace("whatsapp:", "") if caller_number else "Unknown"
+                    if caller_phone != "Unknown" and caller_phone in active_sessions:
+                        session = active_sessions[caller_phone]
+                        llm_ctx = session.get("llm_context")
+                        if llm_ctx:
+                            conversation_messages = firebase_service.extract_conversation_messages(llm_ctx)
+                            if conversation_messages:
+                                await firebase_service.save_voice_messages_to_firebase_batch(
+                                    caller_phone, conversation_messages, session.get("call_sid")
+                                )
+                                self.logger.info("Conversation saved to Firebase before idle timeout termination")
+                except Exception as e:
+                    self.logger.error(f"Failed to save conversation before idle timeout: {e}")
                 
-                # Schedule termination after goodbye
-                asyncio.create_task(self._terminate_call_after_goodbye(
-                    caller_phone, session.get("call_sid"), active_sessions, {}
-                ))
+                # Use EndTaskFrame for clean termination
+                from pipecat.frames.frames import EndTaskFrame, TTSSpeakFrame
+                from pipecat.processors.frame_processor import FrameDirection
+                
+                # Say goodbye first
+                await task.queue_frames([TTSSpeakFrame("Thanks for the chat! Talk to you soon!")])
+                
+                # Signal that the task should end
+                await task.queue_frames([EndTaskFrame()])
             
             return False
         
