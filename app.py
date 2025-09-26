@@ -243,7 +243,7 @@ async def websocket_endpoint(websocket: WebSocket):
         
         # Clean up on WebSocket disconnect
         try:
-            if 'caller_number' in locals() and caller_number:
+            if 'caller_number' in locals() and caller_number and caller_number != "Unknown":
                 caller_phone = extract_phone_number(caller_number)
                 if caller_phone and caller_phone != "Unknown":
                     session = active_sessions.get(caller_phone)
