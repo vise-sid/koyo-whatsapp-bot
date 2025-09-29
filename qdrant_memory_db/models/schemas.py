@@ -36,7 +36,7 @@ class MemoryCreateRequest(BaseModel):
     timestamp: Optional[str] = None
 
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "user_id": "user123",
                 "character_id": "char456",
