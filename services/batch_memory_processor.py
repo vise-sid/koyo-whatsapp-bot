@@ -8,6 +8,7 @@ semantic memories and store them in Qdrant.
 import asyncio
 import logging
 from datetime import datetime
+import uuid
 from typing import List, Dict, Any, Optional
 import openai
 from qdrant_memory_db.database_service import DatabaseService
@@ -89,7 +90,7 @@ class BatchMemoryProcessor:
             
             if success:
                 # Mark messages as synced in Firebase
-                await self._mark_messages_as_synced(unsynced_messages)
+                await self._mark_messages_as_synced(user_id, character_name, unsynced_messages)
                 self.logger.info(f"Successfully processed batch for user {user_id}")
             
             return success
@@ -108,8 +109,8 @@ class BatchMemoryProcessor:
         try:
             messages_ref = firebase_service.db.collection("users").document(user_id).collection("conversations").document(character_name).collection("messages")
             
-            # Query for unsynced messages, ordered by timestamp
-            unsynced_query = messages_ref.where("sync", "==", False).order_by("timestamp").limit(limit)
+            # Query for unsynced messages; avoid order_by to prevent requiring a composite index
+            unsynced_query = messages_ref.where("sync", "==", False).limit(limit)
             unsynced_docs = unsynced_query.get()
             
             messages = []
@@ -118,6 +119,12 @@ class BatchMemoryProcessor:
                 message_data["doc_id"] = doc.id
                 messages.append(message_data)
             
+            # Sort client-side by timestamp if present
+            try:
+                messages.sort(key=lambda x: x.get("timestamp"))
+            except Exception:
+                pass
+
             return messages
             
         except Exception as e:
@@ -194,8 +201,8 @@ class BatchMemoryProcessor:
             # Generate embedding for the conversation memory
             embedding = await self._generate_embedding(conversation_memory)
             
-            # Create memory ID
-            memory_id = f"{user_id}_{character_id}_{int(datetime.now().timestamp())}"
+            # Create memory ID as UUID to satisfy Qdrant ID constraints
+            memory_id = str(uuid.uuid4())
             
             # Store in Qdrant
             success = await self.db_service.create_memory(
@@ -229,13 +236,18 @@ class BatchMemoryProcessor:
             self.logger.error(f"Failed to generate embedding: {e}")
             return []
     
-    async def _mark_messages_as_synced(self, messages: List[Dict[str, Any]]) -> bool:
+    async def _mark_messages_as_synced(self, user_id: str, character_name: str, messages: List[Dict[str, Any]]) -> bool:
         """Mark messages as synced in Firebase"""
         try:
             batch = firebase_service.db.batch()
             
             for msg in messages:
-                doc_ref = firebase_service.db.collection("users").document(msg["user_id"]).collection("conversations").document(msg["character_name"]).collection("messages").document(msg["doc_id"])
+                doc_ref = (
+                    firebase_service.db
+                    .collection("users").document(user_id)
+                    .collection("conversations").document(character_name)
+                    .collection("messages").document(msg["doc_id"]) 
+                )
                 batch.update(doc_ref, {"sync": True})
             
             batch.commit()

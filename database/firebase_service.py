@@ -61,9 +61,9 @@ class FirebaseService:
             return
         
         try:
+            # Do NOT set message_count here to avoid resetting; it is incremented elsewhere
             conversation_metadata = {
                 "last_updated": datetime.now(),
-                "message_count": 0,  # This will be updated when messages are added
                 "character_name": character_name,
             }
             
