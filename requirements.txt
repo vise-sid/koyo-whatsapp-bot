@@ -9,3 +9,5 @@ httpx>=0.25.0
 pipecat-ai[websocket,deepgram,elevenlabs,openai,silero]>=0.0.85
 openai>=1.40.0
 firebase-admin>=6.4.0
+qdrant-client>=1.7.3
+pydantic>=2.6.4
