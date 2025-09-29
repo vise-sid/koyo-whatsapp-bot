@@ -5,12 +5,16 @@ Database service for Qdrant vector database
 import logging
 import asyncio
 from typing import List, Dict, Any, Optional
+import os
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import ResponseHandlingException
 
-from app.core.config import settings
-from app.core.exceptions import DatabaseError
-from app.models.schemas import MemoryEntry
+from .models.schemas import MemoryEntry
+
+
+class DatabaseError(Exception):
+    """Generic database error for Qdrant service"""
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -27,27 +31,19 @@ class DatabaseService:
         """
         self.client: Optional[QdrantClient] = None
 
-        # Use custom settings if provided
-        if custom_settings:
-            self.collection_name = custom_settings.get(
-                "QDRANT_COLLECTION_NAME", settings.QDRANT_COLLECTION_NAME
-            )
-            self.vector_size = custom_settings.get(
-                "QDRANT_VECTOR_SIZE", settings.QDRANT_VECTOR_SIZE
-            )
-            self.qdrant_url = custom_settings.get("QDRANT_URL", settings.QDRANT_URL)
-            self.qdrant_api_key = custom_settings.get(
-                "QDRANT_API_KEY", settings.QDRANT_API_KEY
-            )
-            self.timeout = custom_settings.get(
-                "QDRANT_CONNECTION_TIMEOUT", settings.QDRANT_CONNECTION_TIMEOUT
-            )
-        else:
-            self.collection_name = settings.QDRANT_COLLECTION_NAME
-            self.vector_size = settings.QDRANT_VECTOR_SIZE
-            self.qdrant_url = settings.QDRANT_URL
-            self.qdrant_api_key = settings.QDRANT_API_KEY
-            self.timeout = settings.QDRANT_CONNECTION_TIMEOUT
+        # Resolve configuration from provided custom_settings or environment variables
+        env_collection = os.getenv("QDRANT_COLLECTION_NAME", "koyo_memory")
+        env_vector_size = int(os.getenv("QDRANT_VECTOR_SIZE", "1536"))
+        env_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+        env_api_key = os.getenv("QDRANT_API_KEY", "")
+        env_timeout = int(os.getenv("QDRANT_CONNECTION_TIMEOUT", "30"))
+
+        custom = custom_settings or {}
+        self.collection_name = custom.get("QDRANT_COLLECTION_NAME", env_collection)
+        self.vector_size = custom.get("QDRANT_VECTOR_SIZE", env_vector_size)
+        self.qdrant_url = custom.get("QDRANT_URL", env_url)
+        self.qdrant_api_key = custom.get("QDRANT_API_KEY", env_api_key)
+        self.timeout = custom.get("QDRANT_CONNECTION_TIMEOUT", env_timeout)
 
         self._initialized = False
 
