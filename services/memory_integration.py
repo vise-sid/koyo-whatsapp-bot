@@ -32,7 +32,8 @@ class MemoryIntegration:
                 qdrant_settings={
                     "QDRANT_URL": os.getenv("QDRANT_URL", "http://localhost:6333"),
                     "QDRANT_API_KEY": os.getenv("QDRANT_API_KEY", ""),
-                    "QDRANT_COLLECTION_NAME": os.getenv("QDRANT_COLLECTION_NAME", "koyo_memory"),
+                    # Collection name is fixed to 'koyo_memory' across environments
+                    "QDRANT_COLLECTION_NAME": "koyo_memory",
                     "QDRANT_VECTOR_SIZE": int(os.getenv("QDRANT_VECTOR_SIZE", "1536")),
                     "QDRANT_CONNECTION_TIMEOUT": int(os.getenv("QDRANT_CONNECTION_TIMEOUT", "30"))
                 }

@@ -32,14 +32,16 @@ class DatabaseService:
         self.client: Optional[QdrantClient] = None
 
         # Resolve configuration from provided custom_settings or environment variables
-        env_collection = os.getenv("QDRANT_COLLECTION_NAME", "koyo_memory")
+        # Collection name is hardcoded by design to ensure consistency across environments
+        env_collection = "koyo_memory"
         env_vector_size = int(os.getenv("QDRANT_VECTOR_SIZE", "1536"))
         env_url = os.getenv("QDRANT_URL", "http://localhost:6333")
         env_api_key = os.getenv("QDRANT_API_KEY", "")
         env_timeout = int(os.getenv("QDRANT_CONNECTION_TIMEOUT", "30"))
 
         custom = custom_settings or {}
-        self.collection_name = custom.get("QDRANT_COLLECTION_NAME", env_collection)
+        # Always use fixed collection name
+        self.collection_name = "koyo_memory"
         self.vector_size = custom.get("QDRANT_VECTOR_SIZE", env_vector_size)
         self.qdrant_url = custom.get("QDRANT_URL", env_url)
         self.qdrant_api_key = custom.get("QDRANT_API_KEY", env_api_key)
@@ -65,6 +67,37 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"❌ Failed to initialize database service: {e}")
             raise DatabaseError(f"Database initialization failed: {str(e)}")
+
+    async def _test_connection(self) -> None:
+        """Verify Qdrant connectivity by listing collections."""
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, self.client.get_collections)
+        except Exception as e:
+            raise DatabaseError(f"Qdrant connection failed: {str(e)}")
+
+    async def _initialize_collection(self) -> None:
+        """Ensure the target collection exists with proper vector params and indexes."""
+        loop = asyncio.get_event_loop()
+        try:
+            # Check if collection exists
+            collections = await loop.run_in_executor(None, self.client.get_collections)
+            names = {c.name for c in collections.collections or []}
+            if self.collection_name not in names:
+                # Create collection
+                await loop.run_in_executor(
+                    None,
+                    self.client.create_collection,
+                    self.collection_name,
+                    models.VectorParams(size=self.vector_size, distance=models.Distance.COSINE),
+                )
+                logger.info(f"Created Qdrant collection '{self.collection_name}'")
+
+            # Create payload indexes (best-effort)
+            await self._create_indexes()
+        except Exception as e:
+            # Do not fail hard if index creation fails; only fail if collection creation failed
+            raise DatabaseError(f"Collection initialization failed: {str(e)}")
 
     async def _create_indexes(self):
         """Create payload indexes"""
