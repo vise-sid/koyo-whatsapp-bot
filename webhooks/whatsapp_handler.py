@@ -22,6 +22,7 @@ from utils.helpers import (
 from prompts.meher_text_prompt import get_text_system_prompt
 from database.firebase_service import firebase_service
 from services.memory_integration import memory_integration
+from services.openai_web_search import OpenAIWebSearch
 
 
 class WhatsAppHandler:
@@ -229,7 +230,7 @@ class WhatsAppHandler:
             messages.append(m)
         messages.append({"role": "user", "content": user_text})
 
-        # 5) Call OpenAI with tool support for on-demand memory search + built-in web_search
+        # 5) Call OpenAI with tool support for on-demand memory search + web_search function
         try:
             client = OpenAI(api_key=self.openai_api_key)
 
@@ -252,7 +253,21 @@ class WhatsAppHandler:
                         }
                     }
                 },
-                {"type": "web_search"}
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "Use OpenAI's built-in web search (via helper) to fetch up-to-date info.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string"},
+                                "max_results": {"type": "integer", "minimum": 1, "maximum": 10}
+                            },
+                            "required": ["query"]
+                        }
+                    }
+                }
             ]
 
             # First pass
@@ -328,8 +343,29 @@ class WhatsAppHandler:
                             "content": memory_blob,
                         })
                     elif fname == "web_search":
-                        # For built-in web_search, we do not execute client-side; let the model handle via second call
-                        pass
+                        raw_args = getattr(tool_call.function, "arguments", "") or ""
+                        try:
+                            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                        except Exception:
+                            args = {}
+                        query = (args.get("query") or text).strip()
+                        try:
+                            max_results = int(args.get("max_results", 5) or 5)
+                        except Exception:
+                            max_results = 5
+                        try:
+                            ws = OpenAIWebSearch(self.openai_api_key)
+                            results = await ws.search(query, max_results)
+                            content = "\n".join([f"- {r['title']} {(' | ' + r['url']) if r['url'] else ''}\n  {r['snippet']}" for r in results]) or "[no results]"
+                        except Exception as we:
+                            self.logger.error(f"Web search error (off-call): {we}")
+                            content = "[web search error]"
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": "web_search",
+                            "content": content,
+                        })
 
                 # Second completion using tool results
                 resp2 = client.chat.completions.create(
