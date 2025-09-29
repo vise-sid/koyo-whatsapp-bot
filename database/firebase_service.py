@@ -231,7 +231,7 @@ class FirebaseService:
         try:
             # Count unsynced messages for this user-character pair
             messages_ref = self.db.collection("users").document(user_id).collection("conversations").document(character_name).collection("messages")
-            unsynced_query = messages_ref.where("sync", "==", False)
+            unsynced_query = messages_ref.where(filter=firestore.FieldFilter("sync", "==", False))
             unsynced_docs = unsynced_query.get()
             unsynced_count = len(unsynced_docs)
             

@@ -14,6 +14,7 @@ import openai
 from qdrant_memory_db.database_service import DatabaseService
 from qdrant_memory_db.models.schemas import MemoryEntry
 from database.firebase_service import firebase_service
+from firebase_admin import firestore
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +111,7 @@ class BatchMemoryProcessor:
             messages_ref = firebase_service.db.collection("users").document(user_id).collection("conversations").document(character_name).collection("messages")
             
             # Query for unsynced messages; avoid order_by to prevent requiring a composite index
-            unsynced_query = messages_ref.where("sync", "==", False).limit(limit)
+            unsynced_query = messages_ref.where(filter=firestore.FieldFilter("sync", "==", False)).limit(limit)
             unsynced_docs = unsynced_query.get()
             
             messages = []
