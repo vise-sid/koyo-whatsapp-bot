@@ -136,6 +136,13 @@ class FirebaseService:
             # Commit batch operation (much faster than individual saves)
             batch.commit()
             self.logger.info(f"Batch saved {len(messages)} voice messages to Firebase for {caller_phone}")
+
+            # Increment message_count once per batch to reflect added messages
+            try:
+                conversation_ref = self.db.collection("users").document(caller_phone).collection("conversations").document(character_name)
+                conversation_ref.update({"message_count": firestore.Increment(len(messages))})
+            except Exception as e:
+                self.logger.warning(f"Failed to increment message_count for voice batch: {e}")
             
         except Exception as e:
             self.logger.error(f"Failed to batch save voice messages to Firebase: {e}")
