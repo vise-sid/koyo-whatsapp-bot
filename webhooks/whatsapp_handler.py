@@ -268,6 +268,27 @@ class WhatsAppHandler:
             tool_calls = getattr(choice.message, "tool_calls", None) or []
 
             if tool_calls:
+                # Append the assistant tool_call message first (as per OpenAI spec)
+                try:
+                    assistant_tool_msg = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                },
+                            }
+                            for tc in tool_calls
+                        ],
+                    }
+                    messages.append(assistant_tool_msg)
+                except Exception as build_e:
+                    self.logger.error(f"Failed to build assistant tool message: {build_e}")
+
                 for tool_call in tool_calls:
                     if getattr(tool_call, "function", None) and tool_call.function.name == "search_conversation_memory":
                         # Parse arguments (string JSON per OpenAI spec)
@@ -297,7 +318,7 @@ class WhatsAppHandler:
                             self.logger.error(f"Memory search error (off-call): {me}")
                             memory_blob = "[memory search error]"
 
-                        # Append tool result and do a second pass
+                        # Append tool result (role=tool with matching tool_call_id)
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
