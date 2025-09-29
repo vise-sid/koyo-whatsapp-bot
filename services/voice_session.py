@@ -33,6 +33,7 @@ from pipecat.services.llm_service import FunctionCallParams
 from utils.helpers import get_timeout_for_retry
 from database.firebase_service import firebase_service
 from services.whatsapp_service import WhatsAppMessagingService
+from services.memory_integration import memory_integration
 
 
 class VoiceSessionManager:
@@ -275,8 +276,28 @@ class VoiceSessionManager:
             },
             required=["reason"]
         )
-        
-        return ToolsSchema(standard_tools=[whatsapp_function, terminate_call_function])
+        search_memory_function = FunctionSchema(
+            name="search_conversation_memory",
+            description=(
+                "Search the user's long-term memory (Qdrant) for facts or preferences relevant to the current topic. "
+                "Use this only when you need to recall prior information about the user or past conversations."
+            ),
+            properties={
+                "query": {
+                    "type": "string",
+                    "description": "What you are searching for (short phrase)."
+                },
+                "top_k": {
+                    "type": "number",
+                    "description": "How many memory entries to retrieve (default 5)",
+                    "minimum": 1,
+                    "maximum": 10
+                }
+            },
+            required=["query"]
+        )
+
+        return ToolsSchema(standard_tools=[whatsapp_function, terminate_call_function, search_memory_function])
     
     def _register_function_handlers(
         self,
@@ -357,6 +378,37 @@ class VoiceSessionManager:
         
         llm.register_function("send_whatsapp_message", send_whatsapp_message_handler)
         llm.register_function("terminate_voice_call", terminate_call_handler)
+
+        async def search_conversation_memory_handler(params: FunctionCallParams):
+            """Handle semantic memory search on demand by the LLM"""
+            try:
+                user_id = (caller_number or "").replace("whatsapp:", "") or "unknown"
+                character_name = "meher"
+                query = (params.arguments.get("query") or "").strip()
+                top_k = int(params.arguments.get("top_k", 5) or 5)
+
+                if not query:
+                    await params.result_callback("No query provided")
+                    return
+
+                await memory_integration.initialize()
+                memories = await memory_integration.processor.get_relevant_memories(
+                    user_id=user_id,
+                    character_id=character_name,
+                    current_message=query,
+                    limit=top_k
+                )
+
+                if not memories:
+                    await params.result_callback("No relevant memory found")
+                    return
+
+                summary = "\n".join([f"- {m.message}" for m in memories])
+                await params.result_callback(summary)
+            except Exception as e:
+                await params.result_callback(f"Memory search error: {e}")
+
+        llm.register_function("search_conversation_memory", search_conversation_memory_handler)
     
     async def _handle_user_idle_with_retry(
         self,

@@ -20,6 +20,7 @@ from utils.helpers import (
 )
 from prompts.meher_text_prompt import get_text_system_prompt
 from database.firebase_service import firebase_service
+from services.memory_integration import memory_integration
 
 
 class WhatsAppHandler:
@@ -107,6 +108,18 @@ class WhatsAppHandler:
                 return Response(status_code=204)
 
             # No live session -> off-call LLM chat with context and reply over WhatsApp (freeform)
+            # Optionally query long-term memory when helpful
+            try:
+                await memory_integration.initialize()
+                memory_context = await memory_integration.get_conversation_context(
+                    user_id=from_num,
+                    character_name="meher",
+                    current_message=text_body,
+                    limit=5
+                )
+            except Exception:
+                memory_context = ""
+
             reply_text = await self._handle_multimodal_offcall(text_body, media_items, from_num, offcall_context)
             
             # Send reply via WhatsApp (this would need to be injected as dependency)
