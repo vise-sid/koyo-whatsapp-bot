@@ -140,25 +140,28 @@ class DatabaseService:
         try:
             loop = asyncio.get_event_loop()
 
-            search_results = await loop.run_in_executor(
-                None,
-                self.client.search,
-                self.collection_name,
-                query_vector,
-                models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="user_id", match=models.MatchValue(value=user_id)
-                        ),
-                        models.FieldCondition(
-                            key="character_id",
-                            match=models.MatchValue(value=character_id),
-                        ),
-                    ]
-                ),
-                limit,
-                True,  # with_payload
+            query_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="user_id", match=models.MatchValue(value=user_id)
+                    ),
+                    models.FieldCondition(
+                        key="character_id",
+                        match=models.MatchValue(value=character_id),
+                    ),
+                ]
             )
+
+            def _search():
+                return self.client.search(
+                    collection_name=self.collection_name,
+                    query_vector=query_vector,
+                    query_filter=query_filter,
+                    limit=limit,
+                    with_payload=True,
+                )
+
+            search_results = await loop.run_in_executor(None, _search)
 
             memories = []
             for result in search_results:
@@ -209,9 +212,10 @@ class DatabaseService:
                 },
             )
 
-            await loop.run_in_executor(
-                None, self.client.upsert, self.collection_name, [point]
-            )
+            def _upsert():
+                return self.client.upsert(collection_name=self.collection_name, points=[point])
+
+            await loop.run_in_executor(None, _upsert)
 
             logger.debug(f"Created memory {memory_id} for user {user_id}")
             return True
@@ -250,9 +254,10 @@ class DatabaseService:
                 },
             )
 
-            await loop.run_in_executor(
-                None, self.client.upsert, self.collection_name, [point]
-            )
+            def _upsert():
+                return self.client.upsert(collection_name=self.collection_name, points=[point])
+
+            await loop.run_in_executor(None, _upsert)
 
             logger.debug(f"Updated memory {memory_id} for user {user_id}")
             return True

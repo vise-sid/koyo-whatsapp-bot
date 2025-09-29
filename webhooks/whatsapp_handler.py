@@ -228,16 +228,88 @@ class WhatsAppHandler:
             messages.append(m)
         messages.append({"role": "user", "content": user_text})
 
-        # 5) Call OpenAI for a short response
+        # 5) Call OpenAI with tool support for on-demand memory search
         try:
             client = OpenAI(api_key=self.openai_api_key)
+
+            tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search_conversation_memory",
+                        "description": (
+                            "Search the user's long-term memory (Qdrant) for facts or preferences relevant to the current topic. "
+                            "Use only when prior info about the user would materially improve the reply."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Short description of what to look for"},
+                                "top_k": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Number of items (default 5)"}
+                            },
+                            "required": ["query"]
+                        }
+                    }
+                }
+            ]
+
+            # First pass
             resp = client.chat.completions.create(
                 model="gpt-4o",
                 messages=messages,
                 max_tokens=120,
                 temperature=0.7,
+                tools=tools,
+                tool_choice="auto",
             )
-            reply = (resp.choices[0].message.content or "")[:800]
+
+            choice = resp.choices[0]
+            tool_calls = getattr(choice.message, "tool_calls", None) or []
+
+            if tool_calls:
+                for tool_call in tool_calls:
+                    if tool_call.function and tool_call.function.name == "search_conversation_memory":
+                        try:
+                            args = tool_call.function.arguments or {}
+                        except Exception:
+                            args = {}
+                        query = (args.get("query") or text).strip()
+                        top_k = int(args.get("top_k", 5) or 5)
+
+                        # Execute memory search
+                        try:
+                            await memory_integration.initialize()
+                            memories = await memory_integration.processor.get_relevant_memories(
+                                user_id=user_phone,
+                                character_id="meher",
+                                current_message=query,
+                                limit=top_k
+                            )
+                            memory_lines = [f"- {m.message}" for m in memories] if memories else []
+                            memory_blob = "\n".join(memory_lines) or "[no relevant memory found]"
+                        except Exception as me:
+                            self.logger.error(f"Memory search error (off-call): {me}")
+                            memory_blob = "[memory search error]"
+
+                        # Append tool result and do a second pass
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": "search_conversation_memory",
+                            "content": memory_blob,
+                        })
+
+                # Second completion using tool results
+                resp2 = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=messages,
+                    max_tokens=120,
+                    temperature=0.7,
+                )
+                reply = (resp2.choices[0].message.content or "")[:800]
+            else:
+                reply = (choice.message.content or "")[:800]
+
         except Exception as e:
             self.logger.error(f"Off-call LLM error: {e}")
             reply = "थोड़ी technical दिक्कत हो गयी मेरी तरफ—एक छोटा सा message फिर भेजो, मैं तुरंत जवाब दूँगी।"
