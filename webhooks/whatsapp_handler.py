@@ -229,7 +229,7 @@ class WhatsAppHandler:
             messages.append(m)
         messages.append({"role": "user", "content": user_text})
 
-        # 5) Call OpenAI with tool support for on-demand memory search
+        # 5) Call OpenAI with tool support for on-demand memory search + built-in web_search
         try:
             client = OpenAI(api_key=self.openai_api_key)
 
@@ -251,7 +251,8 @@ class WhatsAppHandler:
                             "required": ["query"]
                         }
                     }
-                }
+                },
+                {"type": "web_search"}
             ]
 
             # First pass
@@ -290,7 +291,8 @@ class WhatsAppHandler:
                     self.logger.error(f"Failed to build assistant tool message: {build_e}")
 
                 for tool_call in tool_calls:
-                    if getattr(tool_call, "function", None) and tool_call.function.name == "search_conversation_memory":
+                    fname = getattr(getattr(tool_call, "function", None), "name", "")
+                    if fname == "search_conversation_memory":
                         # Parse arguments (string JSON per OpenAI spec)
                         raw_args = getattr(tool_call.function, "arguments", "") or ""
                         try:
@@ -325,6 +327,9 @@ class WhatsAppHandler:
                             "name": "search_conversation_memory",
                             "content": memory_blob,
                         })
+                    elif fname == "web_search":
+                        # For built-in web_search, we do not execute client-side; let the model handle via second call
+                        pass
 
                 # Second completion using tool results
                 resp2 = client.chat.completions.create(
@@ -332,6 +337,8 @@ class WhatsAppHandler:
                     messages=messages,
                     max_tokens=120,
                     temperature=0.7,
+                    tools=tools,
+                    tool_choice="auto",
                 )
                 reply = (resp2.choices[0].message.content or "")[:800]
             else:

@@ -34,6 +34,7 @@ from utils.helpers import get_timeout_for_retry
 from database.firebase_service import firebase_service
 from services.whatsapp_service import WhatsAppMessagingService
 from services.memory_integration import memory_integration
+from services.openai_web_search import OpenAIWebSearch
 
 
 class VoiceSessionManager:
@@ -136,6 +137,7 @@ class VoiceSessionManager:
             auth_token=self.twilio_auth_token,
             from_number=self.whatsapp_from_number
         )
+        web_search_client = OpenAIWebSearch(self.openai_api_key)
         
         # Setup function tools
         tools = self._setup_function_tools()
@@ -297,7 +299,19 @@ class VoiceSessionManager:
             required=["query"]
         )
 
-        return ToolsSchema(standard_tools=[whatsapp_function, terminate_call_function, search_memory_function])
+        web_search_function = FunctionSchema(
+            name="web_search",
+            description=(
+                "Use OpenAI's built-in web search to fetch up-to-date info (news, prices, current facts)."
+            ),
+            properties={
+                "query": {"type": "string", "description": "Search query"},
+                "max_results": {"type": "number", "description": "Max items to summarize (default 5)"}
+            },
+            required=["query"]
+        )
+
+        return ToolsSchema(standard_tools=[whatsapp_function, terminate_call_function, search_memory_function, web_search_function])
     
     def _register_function_handlers(
         self,
@@ -409,6 +423,25 @@ class VoiceSessionManager:
                 await params.result_callback(f"Memory search error: {e}")
 
         llm.register_function("search_conversation_memory", search_conversation_memory_handler)
+
+        async def web_search_handler(params: FunctionCallParams):
+            """Handle OpenAI built-in web search on demand"""
+            try:
+                query = (params.arguments.get("query") or "").strip()
+                max_results = int(params.arguments.get("max_results", 5) or 5)
+                if not query:
+                    await params.result_callback("No query provided")
+                    return
+                results = await web_search_client.search(query, max_results)
+                if not results:
+                    await params.result_callback("[no results]")
+                    return
+                lines = [f"- {r['title']} {(' | ' + r['url']) if r['url'] else ''}\n  {r['snippet']}" for r in results]
+                await params.result_callback("\n".join(lines))
+            except Exception as e:
+                await params.result_callback(f"web search error: {e}")
+
+        llm.register_function("web_search", web_search_handler)
     
     async def _handle_user_idle_with_retry(
         self,
