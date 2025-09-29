@@ -28,12 +28,18 @@ from webhooks.whatsapp_handler import WhatsAppHandler
 from webhooks.voice_handler import VoiceHandler
 from database.firebase_service import firebase_service
 from utils.helpers import extract_phone_number
+from services.memory_trigger_service import memory_router
+from services.firebase_trigger import firebase_router
 
 # Configure logging
 logger = logging.getLogger("uvicorn.error")
 
 # Initialize FastAPI app
 app = FastAPI(title="Koyo Voice & WhatsApp Integration")
+
+# Include memory and Firebase trigger routers
+app.include_router(memory_router)
+app.include_router(firebase_router)
 
 # Global storage for session management (in production, use Redis or database)
 caller_info_storage: Dict[str, Any] = {}

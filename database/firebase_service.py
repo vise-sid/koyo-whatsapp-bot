@@ -204,11 +204,58 @@ class FirebaseService:
             except Exception as e:
                 self.logger.warning(f"Failed to update message count: {e}")
             
+            # Trigger batch processing check (async, non-blocking)
+            try:
+                await self._trigger_batch_check(user_id, character_name)
+            except Exception as e:
+                self.logger.warning(f"Failed to trigger batch check: {e}")
+            
             return True
             
         except Exception as e:
             self.logger.error(f"Failed to save message to Firebase: {e}")
             return False
+
+    async def _trigger_batch_check(self, user_id: str, character_name: str):
+        """
+        Trigger batch processing check for a user-character pair.
+        This is called after each message is saved to Firebase.
+        """
+        try:
+            # Count unsynced messages for this user-character pair
+            messages_ref = self.db.collection("users").document(user_id).collection("conversations").document(character_name).collection("messages")
+            unsynced_query = messages_ref.where("sync", "==", False)
+            unsynced_docs = unsynced_query.get()
+            unsynced_count = len(unsynced_docs)
+            
+            self.logger.debug(f"User {user_id} has {unsynced_count} unsynced messages")
+            
+            # If we have enough unsynced messages, trigger batch processing
+            if unsynced_count >= 25:
+                self.logger.info(f"Triggering batch processing for user {user_id} ({unsynced_count} unsynced messages)")
+                
+                # Import here to avoid circular imports
+                from services.batch_memory_processor import BatchMemoryProcessor
+                import os
+                
+                # Create processor and check batch
+                processor = BatchMemoryProcessor(
+                    openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+                    qdrant_settings={
+                        "QDRANT_URL": os.getenv("QDRANT_URL", "http://localhost:6333"),
+                        "QDRANT_API_KEY": os.getenv("QDRANT_API_KEY", ""),
+                        "QDRANT_COLLECTION_NAME": os.getenv("QDRANT_COLLECTION_NAME", "chat_memory"),
+                        "QDRANT_VECTOR_SIZE": int(os.getenv("QDRANT_VECTOR_SIZE", "1536")),
+                        "QDRANT_CONNECTION_TIMEOUT": int(os.getenv("QDRANT_CONNECTION_TIMEOUT", "30"))
+                    }
+                )
+                
+                # Initialize and process batch
+                await processor.initialize()
+                await processor.process_user_character_batch(user_id, character_name)
+                
+        except Exception as e:
+            self.logger.error(f"Failed to trigger batch check: {e}")
 
 
 # Global Firebase service instance
