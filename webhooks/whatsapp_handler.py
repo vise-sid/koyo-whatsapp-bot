@@ -6,6 +6,7 @@ and manages both active voice sessions and off-call text conversations.
 """
 
 import logging
+import json
 from typing import List, Dict, Any, Optional
 
 from fastapi import Request, Response
@@ -268,13 +269,18 @@ class WhatsAppHandler:
 
             if tool_calls:
                 for tool_call in tool_calls:
-                    if tool_call.function and tool_call.function.name == "search_conversation_memory":
+                    if getattr(tool_call, "function", None) and tool_call.function.name == "search_conversation_memory":
+                        # Parse arguments (string JSON per OpenAI spec)
+                        raw_args = getattr(tool_call.function, "arguments", "") or ""
                         try:
-                            args = tool_call.function.arguments or {}
+                            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
                         except Exception:
                             args = {}
                         query = (args.get("query") or text).strip()
-                        top_k = int(args.get("top_k", 5) or 5)
+                        try:
+                            top_k = int(args.get("top_k", 5) or 5)
+                        except Exception:
+                            top_k = 5
 
                         # Execute memory search
                         try:
