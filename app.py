@@ -41,6 +41,19 @@ app = FastAPI(title="Koyo Voice & WhatsApp Integration")
 app.include_router(memory_router)
 app.include_router(firebase_router)
 
+# ElevenLabs SIP webhook: returns XML instructing Twilio to dial ElevenLabs SIP
+@app.post("/elevenlabs-voice-webhook")
+async def elevenlabs_voice_webhook() -> Response:
+    xml_body = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<Response>\n"
+        "<Dial>\n"
+        "<Sip>sip:+19346497573@sip.rtc.elevenlabs.io:5060;transport=tcp</Sip>\n"
+        "</Dial>\n"
+        "</Response>\n"
+    )
+    return Response(content=xml_body, media_type="application/xml")
+
 # Global storage for session management (in production, use Redis or database)
 caller_info_storage: Dict[str, Any] = {}
 active_sessions: Dict[str, Any] = {}
