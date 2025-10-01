@@ -225,8 +225,8 @@ class WhatsAppHandler:
 
         # 4) Build messages array (bounded history)
         messages = [{"role": "system", "content": system_text}]
-        # include last ~8 messages from history for context
-        for m in history[-8:]:
+        # include last ~25 messages from history for context
+        for m in history[-25:]:
             messages.append(m)
         messages.append({"role": "user", "content": user_text})
 
