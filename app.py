@@ -66,6 +66,17 @@ async def elevenlabs_init_webhook(request: Request) -> JSONResponse:
     Receives caller information and returns personalized conversation data.
     """
     try:
+        # Optional shared-secret validation (recommended)
+        expected_secret = os.getenv("ELEVENLABS_INIT_WEBHOOK_SECRET", "")
+        if expected_secret:
+            provided_secret = (
+                request.headers.get("X-EL-Secret")
+                or request.headers.get("x-el-secret")
+                or request.headers.get("Authorization", "").replace("Bearer ", "")
+            )
+            if not provided_secret or provided_secret != expected_secret:
+                logger.warning("Init webhook secret validation failed")
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
         # Parse request body
         body = await request.json()
         caller_id = body.get("caller_id")
@@ -100,13 +111,13 @@ async def elevenlabs_init_webhook(request: Request) -> JSONResponse:
                 "user_name": user_context.get("name", "User"),
                 "last_interaction": user_context.get("last_interaction", ""),
                 "conversation_count": user_context.get("conversation_count", 0)
-            },
-            "conversation_config_override": {
-                "agent": {
-                    "first_message": f"Hello! I'm Meher, your AI companion. How can I help you today?",
-                    "language": "en"
-                }
             }
+            # "conversation_config_override": {
+            #     "agent": {
+            #         "first_message": f"Hello! I'm Meher, your AI companion. How can I help you today?",
+            #         "language": "en"
+            #     }
+            # }
         }
         
         logger.info(f"Returning conversation initiation data for caller {caller_id}")
