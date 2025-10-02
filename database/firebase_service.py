@@ -27,23 +27,31 @@ class FirebaseService:
     def _initialize_firebase(self):
         """Initialize Firebase connection"""
         try:
-            # Try to initialize with service account key from environment
-            firebase_credentials = os.getenv("FIREBASE_CREDENTIALS")
-            if firebase_credentials:
-                # Parse JSON credentials from environment variable
-                cred_dict = json.loads(firebase_credentials)
-                cred = credentials.Certificate(cred_dict)
-                firebase_admin.initialize_app(cred)
-            else:
-                # Try to initialize with default credentials (for local development)
-                firebase_admin.initialize_app()
+            # Check if Firebase app is already initialized
+            try:
+                # Try to get the default app - if it exists, we're good
+                app = firebase_admin.get_app()
+                self.logger.info("Firebase app already initialized, reusing existing connection")
+            except ValueError:
+                # App doesn't exist, initialize it
+                firebase_credentials = os.getenv("FIREBASE_CREDENTIALS")
+                if firebase_credentials:
+                    # Parse JSON credentials from environment variable
+                    cred_dict = json.loads(firebase_credentials)
+                    cred = credentials.Certificate(cred_dict)
+                    firebase_admin.initialize_app(cred)
+                    self.logger.info("Firebase initialized with service account credentials")
+                else:
+                    # Try to initialize with default credentials (for local development)
+                    firebase_admin.initialize_app()
+                    self.logger.info("Firebase initialized with default credentials")
             
             self.db = firestore.client()
             # Test Firebase connection
             test_doc = self.db.collection("_health_check").document("test")
             test_doc.set({"timestamp": datetime.now()}, merge=True)
             test_doc.delete()
-            self.logger.info("Firebase initialized and tested successfully")
+            self.logger.info("Firebase connection tested successfully")
         except Exception as e:
             self.logger.error(f"Firebase initialization failed: {e}")
             self.db = None

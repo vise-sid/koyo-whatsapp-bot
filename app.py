@@ -150,8 +150,7 @@ async def _handle_transcription_webhook(payload: dict):
             return
         
         # Store transcript in Firebase
-        from database.firebase_service import FirebaseService
-        firebase_service = FirebaseService()
+        from database.firebase_service import firebase_service
         
         # Create transcript document structure
         transcript_data = {
@@ -187,8 +186,7 @@ async def _handle_audio_webhook(payload: dict):
             return
         
         # Store audio metadata in Firebase (not the actual audio data due to size)
-        from database.firebase_service import FirebaseService
-        firebase_service = FirebaseService()
+        from database.firebase_service import firebase_service
         
         audio_data = {
             "conversation_id": conversation_id,
