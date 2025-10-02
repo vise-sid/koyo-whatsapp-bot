@@ -20,6 +20,10 @@ from typing import Dict, Any
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, Response, JSONResponse
+import hmac
+import hashlib
+import time
+import json
 
 # Import our modular services
 from services.whatsapp_service import WhatsAppMessagingService
@@ -53,6 +57,156 @@ async def elevenlabs_voice_webhook() -> Response:
         "</Response>\n"
     )
     return Response(content=xml_body, media_type="application/xml")
+
+# ElevenLabs post-call webhook: handles transcript data from completed calls
+@app.post("/post-call-eleven")
+async def post_call_eleven_webhook(request: Request) -> JSONResponse:
+    try:
+        # Get raw body for HMAC validation
+        body = await request.body()
+        
+        # Get signature header
+        signature_header = request.headers.get("elevenlabs-signature")
+        if not signature_header:
+            logger.warning("Missing ElevenLabs signature header")
+            return JSONResponse({"error": "Missing signature header"}, status_code=401)
+        
+        # Parse signature header
+        headers = signature_header.split(",")
+        timestamp = None
+        hmac_signature = None
+        
+        for header in headers:
+            if header.startswith("t="):
+                timestamp = header[2:]
+            elif header.startswith("v0="):
+                hmac_signature = header
+        
+        if not timestamp or not hmac_signature:
+            logger.warning("Invalid signature format")
+            return JSONResponse({"error": "Invalid signature format"}, status_code=401)
+        
+        # Validate timestamp (within 30 minutes)
+        tolerance = int(time.time()) - 30 * 60
+        if int(timestamp) < tolerance:
+            logger.warning("Request timestamp expired")
+            return JSONResponse({"error": "Request expired"}, status_code=403)
+        
+        # Validate HMAC signature
+        webhook_secret = os.getenv("ELEVENLABS_WEBHOOK_SECRET")
+        if not webhook_secret:
+            logger.error("ELEVENLABS_WEBHOOK_SECRET not configured")
+            return JSONResponse({"error": "Webhook secret not configured"}, status_code=500)
+        
+        full_payload_to_sign = f"{timestamp}.{body.decode('utf-8')}"
+        mac = hmac.new(
+            key=webhook_secret.encode("utf-8"),
+            msg=full_payload_to_sign.encode("utf-8"),
+            digestmod=hashlib.sha256,
+        )
+        digest = 'v0=' + mac.hexdigest()
+        
+        if hmac_signature != digest:
+            logger.warning("Invalid HMAC signature")
+            return JSONResponse({"error": "Invalid signature"}, status_code=401)
+        
+        # Parse webhook payload
+        try:
+            payload = json.loads(body.decode('utf-8'))
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON payload: {e}")
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        
+        # Process webhook based on type
+        webhook_type = payload.get("type")
+        if webhook_type == "post_call_transcription":
+            await _handle_transcription_webhook(payload)
+        elif webhook_type == "post_call_audio":
+            await _handle_audio_webhook(payload)
+        else:
+            logger.warning(f"Unknown webhook type: {webhook_type}")
+            return JSONResponse({"error": "Unknown webhook type"}, status_code=400)
+        
+        logger.info(f"Successfully processed {webhook_type} webhook")
+        return JSONResponse({"status": "received"})
+        
+    except Exception as e:
+        logger.error(f"Error processing ElevenLabs webhook: {e}")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+async def _handle_transcription_webhook(payload: dict):
+    """Handle post-call transcription webhook from ElevenLabs"""
+    try:
+        data = payload.get("data", {})
+        conversation_id = data.get("conversation_id")
+        agent_id = data.get("agent_id")
+        user_id = data.get("user_id")
+        transcript = data.get("transcript", [])
+        metadata = data.get("metadata", {})
+        analysis = data.get("analysis", {})
+        
+        if not conversation_id:
+            logger.error("Missing conversation_id in webhook payload")
+            return
+        
+        # Store transcript in Firebase
+        from database.firebase_service import FirebaseService
+        firebase_service = FirebaseService()
+        
+        # Create transcript document structure
+        transcript_data = {
+            "conversation_id": conversation_id,
+            "agent_id": agent_id,
+            "user_id": user_id,
+            "transcript": transcript,
+            "metadata": metadata,
+            "analysis": analysis,
+            "webhook_timestamp": payload.get("event_timestamp"),
+            "created_at": datetime.utcnow().isoformat(),
+            "source": "elevenlabs_webhook"
+        }
+        
+        # Store in Firebase
+        await firebase_service.save_transcript_to_firebase(transcript_data)
+        
+        logger.info(f"Stored transcript for conversation {conversation_id}")
+        
+    except Exception as e:
+        logger.error(f"Error handling transcription webhook: {e}")
+
+async def _handle_audio_webhook(payload: dict):
+    """Handle post-call audio webhook from ElevenLabs"""
+    try:
+        data = payload.get("data", {})
+        conversation_id = data.get("conversation_id")
+        agent_id = data.get("agent_id")
+        full_audio = data.get("full_audio")
+        
+        if not conversation_id or not full_audio:
+            logger.error("Missing required fields in audio webhook")
+            return
+        
+        # Store audio metadata in Firebase (not the actual audio data due to size)
+        from database.firebase_service import FirebaseService
+        firebase_service = FirebaseService()
+        
+        audio_data = {
+            "conversation_id": conversation_id,
+            "agent_id": agent_id,
+            "has_audio": True,
+            "audio_size_bytes": len(full_audio.encode('utf-8')),
+            "webhook_timestamp": payload.get("event_timestamp"),
+            "created_at": datetime.utcnow().isoformat(),
+            "source": "elevenlabs_webhook"
+        }
+        
+        # Store audio metadata in Firebase
+        await firebase_service.save_audio_metadata_to_firebase(audio_data)
+        
+        logger.info(f"Stored audio metadata for conversation {conversation_id}")
+        
+    except Exception as e:
+        logger.error(f"Error handling audio webhook: {e}")
 
 # Global storage for session management (in production, use Redis or database)
 caller_info_storage: Dict[str, Any] = {}

@@ -264,6 +264,68 @@ class FirebaseService:
         except Exception as e:
             self.logger.error(f"Failed to trigger batch check: {e}")
 
+    async def save_transcript_to_firebase(self, transcript_data: Dict[str, Any]) -> bool:
+        """
+        Save ElevenLabs transcript data to Firebase.
+        
+        Args:
+            transcript_data: Dictionary containing transcript information
+            
+        Returns:
+            bool: True if saved successfully, False otherwise
+        """
+        if self.db is None:
+            self.logger.warning("Firebase not initialized, skipping transcript save")
+            return False
+        
+        try:
+            conversation_id = transcript_data.get("conversation_id")
+            if not conversation_id:
+                self.logger.error("Missing conversation_id in transcript data")
+                return False
+            
+            # Store transcript in a dedicated collection
+            transcript_ref = self.db.collection("elevenlabs_transcripts").document(conversation_id)
+            transcript_ref.set(transcript_data, merge=True)
+            
+            self.logger.info(f"Saved transcript for conversation {conversation_id}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save transcript to Firebase: {e}")
+            return False
+
+    async def save_audio_metadata_to_firebase(self, audio_data: Dict[str, Any]) -> bool:
+        """
+        Save ElevenLabs audio metadata to Firebase.
+        
+        Args:
+            audio_data: Dictionary containing audio metadata
+            
+        Returns:
+            bool: True if saved successfully, False otherwise
+        """
+        if self.db is None:
+            self.logger.warning("Firebase not initialized, skipping audio metadata save")
+            return False
+        
+        try:
+            conversation_id = audio_data.get("conversation_id")
+            if not conversation_id:
+                self.logger.error("Missing conversation_id in audio data")
+                return False
+            
+            # Store audio metadata in a dedicated collection
+            audio_ref = self.db.collection("elevenlabs_audio_metadata").document(conversation_id)
+            audio_ref.set(audio_data, merge=True)
+            
+            self.logger.info(f"Saved audio metadata for conversation {conversation_id}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save audio metadata to Firebase: {e}")
+            return False
+
 
 # Global Firebase service instance
 firebase_service = FirebaseService()
