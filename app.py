@@ -58,6 +58,90 @@ async def elevenlabs_voice_webhook() -> Response:
     )
     return Response(content=xml_body, media_type="application/xml")
 
+# ElevenLabs conversation initiation webhook: provides caller data for personalization
+@app.post("/elevenlabs-init-webhook")
+async def elevenlabs_init_webhook(request: Request) -> JSONResponse:
+    """
+    Webhook endpoint for ElevenLabs to fetch conversation initiation data.
+    Receives caller information and returns personalized conversation data.
+    """
+    try:
+        # Parse request body
+        body = await request.json()
+        caller_id = body.get("caller_id")
+        agent_id = body.get("agent_id")
+        called_number = body.get("called_number")
+        call_sid = body.get("call_sid")
+        
+        logger.info(f"ElevenLabs init webhook called with caller_id: {caller_id}, call_sid: {call_sid}")
+        
+        if not caller_id:
+            logger.warning("Missing caller_id in ElevenLabs init webhook")
+            return JSONResponse({"error": "Missing caller_id"}, status_code=400)
+        
+        # Store call information for later use in post-call webhook
+        # We'll use call_sid as the key to map back to the caller
+        if call_sid:
+            caller_info_storage[call_sid] = {
+                "caller_id": caller_id,
+                "agent_id": agent_id,
+                "called_number": called_number,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        
+        # Get user's recent conversation context for personalization
+        user_context = await _get_user_context_for_call(caller_id)
+        
+        # Return conversation initiation data
+        response_data = {
+            "type": "conversation_initiation_client_data",
+            "dynamic_variables": {
+                "user_phone": caller_id,
+                "user_name": user_context.get("name", "User"),
+                "last_interaction": user_context.get("last_interaction", ""),
+                "conversation_count": user_context.get("conversation_count", 0)
+            },
+            "conversation_config_override": {
+                "agent": {
+                    "first_message": f"Hello! I'm Meher, your AI companion. How can I help you today?",
+                    "language": "en"
+                }
+            }
+        }
+        
+        logger.info(f"Returning conversation initiation data for caller {caller_id}")
+        return JSONResponse(response_data)
+        
+    except Exception as e:
+        logger.error(f"Error processing ElevenLabs init webhook: {e}")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+async def _get_user_context_for_call(caller_id: str) -> dict:
+    """Get user context for conversation personalization"""
+    try:
+        from database.firebase_service import firebase_service
+        
+        if not firebase_service.db:
+            return {}
+        
+        # Get user's conversation metadata
+        user_ref = firebase_service.db.collection("users").document(caller_id)
+        user_doc = user_ref.get()
+        
+        if user_doc.exists:
+            user_data = user_doc.to_dict()
+            return {
+                "name": user_data.get("name", "User"),
+                "last_interaction": user_data.get("last_interaction", ""),
+                "conversation_count": user_data.get("conversation_count", 0)
+            }
+        
+        return {}
+        
+    except Exception as e:
+        logger.error(f"Error getting user context: {e}")
+        return {}
+
 # ElevenLabs post-call webhook: handles transcript data from completed calls
 @app.post("/post-call-eleven")
 async def post_call_eleven_webhook(request: Request) -> JSONResponse:
@@ -149,6 +233,19 @@ async def _handle_transcription_webhook(payload: dict):
             logger.error("Missing conversation_id in webhook payload")
             return
         
+        # Try to get caller information from our stored data
+        # Look for call_sid in metadata or try to match by conversation_id
+        caller_phone = None
+        call_sid = metadata.get("call_sid")
+        
+        if call_sid and call_sid in caller_info_storage:
+            caller_phone = caller_info_storage[call_sid]["caller_id"]
+            logger.info(f"Found caller phone {caller_phone} for call_sid {call_sid}")
+        else:
+            # Fallback: try to extract from user_id or other fields
+            caller_phone = user_id
+            logger.warning(f"Using fallback caller phone {caller_phone}")
+        
         # Store transcript in Firebase
         from database.firebase_service import firebase_service
         
@@ -157,6 +254,7 @@ async def _handle_transcription_webhook(payload: dict):
             "conversation_id": conversation_id,
             "agent_id": agent_id,
             "user_id": user_id,
+            "caller_phone": caller_phone,
             "transcript": transcript,
             "metadata": metadata,
             "analysis": analysis,
@@ -168,10 +266,58 @@ async def _handle_transcription_webhook(payload: dict):
         # Store in Firebase
         await firebase_service.save_transcript_to_firebase(transcript_data)
         
+        # If we have caller phone, also store individual messages in user's collection
+        if caller_phone:
+            await _store_user_messages_from_transcript(caller_phone, transcript, conversation_id, metadata)
+        
         logger.info(f"Stored transcript for conversation {conversation_id}")
         
     except Exception as e:
         logger.error(f"Error handling transcription webhook: {e}")
+
+async def _store_user_messages_from_transcript(caller_phone: str, transcript: list, conversation_id: str, metadata: dict):
+    """Store individual messages from transcript in user's collection"""
+    try:
+        from database.firebase_service import firebase_service
+        
+        if not firebase_service.db:
+            return
+        
+        character_name = "meher"
+        call_sid = metadata.get("call_sid")
+        
+        # Create or update conversation metadata
+        await firebase_service.create_or_update_conversation_metadata(caller_phone, character_name, call_sid)
+        
+        # Store each message from transcript
+        messages_to_store = []
+        for turn in transcript:
+            role = turn.get("role")
+            message = turn.get("message", "")
+            time_in_call = turn.get("time_in_call_secs", 0)
+            
+            if role in ["user", "agent"] and message.strip():
+                sender = "user" if role == "user" else "character"
+                messages_to_store.append({
+                    "sender": sender,
+                    "content": message[:1000],  # Limit content length
+                    "timestamp": datetime.utcnow(),
+                    "sync": False,
+                    "conversation_type": "voice",
+                    "call_sid": call_sid,
+                    "conversation_id": conversation_id,
+                    "time_in_call_secs": time_in_call
+                })
+        
+        if messages_to_store:
+            # Use batch save for efficiency
+            await firebase_service.save_voice_messages_to_firebase_batch(
+                caller_phone, messages_to_store, call_sid
+            )
+            logger.info(f"Stored {len(messages_to_store)} messages for user {caller_phone}")
+        
+    except Exception as e:
+        logger.error(f"Error storing user messages from transcript: {e}")
 
 async def _handle_audio_webhook(payload: dict):
     """Handle post-call audio webhook from ElevenLabs"""
