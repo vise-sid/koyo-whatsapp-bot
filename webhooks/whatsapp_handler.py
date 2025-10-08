@@ -16,6 +16,7 @@ from utils.helpers import (
     validate_twilio_http, 
     transcribe_twilio_audio, 
     caption_image_url, 
+    caption_image_from_twilio_url,
     fetch_text_excerpt,
     get_current_time_context
 )
@@ -172,8 +173,11 @@ class WhatsAppHandler:
                         url, self.twilio_account_sid, self.twilio_auth_token, self.openai_api_key
                     )
                     parts.append(f"[audio transcript] {transcript}" if transcript else "[audio note received]")
-                elif "image/" in ctype:
-                    caption = await caption_image_url(url, self.openai_api_key)
+                elif "image/" in ctype or (not ctype and (url or "").lower().endswith((".jpg",".jpeg",".png",".gif",".webp",".bmp"))):
+                    # Prefer fetching via Twilio-auth and sending as base64 data URL
+                    caption = await caption_image_from_twilio_url(
+                        url, self.twilio_account_sid, self.twilio_auth_token, self.openai_api_key, ctype
+                    ) or await caption_image_url(url, self.openai_api_key)
                     parts.append(f"[image] {caption}" if caption else "[image received]")
                 elif "text/" in ctype:
                     excerpt = await fetch_text_excerpt(

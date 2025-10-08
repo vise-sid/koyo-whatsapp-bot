@@ -8,6 +8,7 @@ including time context, phone number extraction, and media processing.
 import logging
 from datetime import datetime
 from typing import Dict, Any, List
+import base64
 from urllib.parse import parse_qs
 
 import httpx
@@ -110,6 +111,58 @@ async def caption_image_url(image_url: str, openai_api_key: str) -> str:
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
         logging.getLogger(__name__).error(f"Image captioning failed: {e}")
+        return ""
+
+
+def _infer_image_content_type_from_url(url: str) -> str:
+    """Best-effort inference of image content type from URL extension."""
+    lower = (url or "").lower()
+    if lower.endswith(".jpg") or lower.endswith(".jpeg"):
+        return "image/jpeg"
+    if lower.endswith(".png"):
+        return "image/png"
+    if lower.endswith(".gif"):
+        return "image/gif"
+    if lower.endswith(".webp"):
+        return "image/webp"
+    if lower.endswith(".bmp"):
+        return "image/bmp"
+    return "image/jpeg"  # sensible default
+
+
+async def caption_image_from_twilio_url(
+    image_url: str,
+    account_sid: str,
+    auth_token: str,
+    openai_api_key: str,
+    content_type_hint: str = "",
+) -> str:
+    """
+    Fetch an image from a Twilio-authenticated URL and caption it via OpenAI Vision.
+    Uses a data URL (base64) so OpenAI doesn't need to fetch from Twilio.
+    """
+    try:
+        image_bytes = await fetch_with_twilio_auth(image_url, account_sid, auth_token)
+        ctype = (content_type_hint or _infer_image_content_type_from_url(image_url))
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        data_url = f"data:{ctype};base64,{b64}"
+
+        client = OpenAI(api_key=openai_api_key)
+        prompt = "Caption the image in one short casual line and infer the likely intent if obvious."
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ]}
+            ],
+            max_tokens=120,
+            temperature=0.7,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Image captioning (Twilio URL) failed: {e}")
         return ""
 
 
