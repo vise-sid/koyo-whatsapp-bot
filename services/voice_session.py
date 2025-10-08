@@ -154,7 +154,7 @@ class VoiceSessionManager:
         # Register function handlers
         self._register_function_handlers(
             llm, whatsapp_service, caller_number, caller_name, 
-            call_sid, active_sessions, caller_info_storage
+            call_sid, active_sessions, caller_info_storage, web_search_client
         )
         
         tts = ElevenLabsTTSService(
@@ -349,7 +349,8 @@ class VoiceSessionManager:
         caller_name: str,
         call_sid: str,
         active_sessions: Dict[str, Any],
-        caller_info_storage: Dict[str, Any]
+        caller_info_storage: Dict[str, Any],
+        web_search_client: OpenAIWebSearch
     ):
         """Register function handlers with the LLM service"""
         
