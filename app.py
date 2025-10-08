@@ -90,13 +90,17 @@ async def elevenlabs_init_webhook(request: Request) -> JSONResponse:
             logger.warning("Missing caller_id in ElevenLabs init webhook")
             return JSONResponse({"error": "Missing caller_id"}, status_code=400)
         
-        # Store call information for later use in post-call webhook
+        # Store call information for later use in WebSocket and post-call webhook
         # We'll use call_sid as the key to map back to the caller
         if call_sid:
+            # Align keys with voice_handler storage keys for consistent retrieval
             caller_info_storage[call_sid] = {
-                "caller_id": caller_id,
+                "caller_id": caller_id,               # raw field from ElevenLabs
                 "agent_id": agent_id,
                 "called_number": called_number,
+                "caller_number": caller_id,           # normalized key used elsewhere
+                "caller_name": body.get("caller_name", "Unknown"),
+                "to_number": called_number,
                 "timestamp": datetime.utcnow().isoformat()
             }
         
