@@ -30,9 +30,7 @@ class OpenAIWebSearch:
         resp = self.client.responses.create(
             model="gpt-5",
             tools=[{"type": "web_search"}],
-            input=f"{query}",
-            max_output_tokens=300,
-            temperature=0.3,
+            input=f"{query}"
         )
 
         # Return a single summarized item; callers expect a list
