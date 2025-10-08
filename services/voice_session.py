@@ -160,12 +160,11 @@ class VoiceSessionManager:
         tts = ElevenLabsTTSService(
             api_key=self.elevenlabs_api_key,
             voice_id=self.elevenlabs_voice_id,
-            model="eleven_flash_v2_5",
+            model="eleven_turbo_v2_5",
             input_params=ElevenLabsTTSService.InputParams(
                 language=Language.HI,
                 stability=0.5,
-                similarity_boost=0.9,
-                style=0.5,
+                similarity_boost=0.8,
                 use_speaker_boost=False,
                 speed=0.9,
                 auto_mode=True,
