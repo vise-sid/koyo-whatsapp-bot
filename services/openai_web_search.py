@@ -1,7 +1,15 @@
 """
 OpenAI built-in web search helper using the Responses API.
 
-Requires OPENAI_API_KEY in environment. Uses model 'gpt-4.1' with tools=[{"type": "web_search"}].
+Pattern per request:
+from openai import OpenAI
+client = OpenAI()
+response = client.responses.create(
+    model="gpt-5",
+    tools=[{"type": "web_search"}],
+    input="What was a positive news story from today?"
+)
+print(response.output_text)
 """
 
 import os
@@ -18,21 +26,16 @@ class OpenAIWebSearch:
         if not self.client or not query:
             return []
 
-        # Minimal input conforming to Responses API with text content
-        input_msgs = [
-            {"role": "user", "content": [{"type": "text", "text": f"Search the web: {query}"}]}
-        ]
-
+        # Use Responses API directly with plain string input and web_search tool
         resp = self.client.responses.create(
-            model="gpt-4.1",
-            input=input_msgs,
+            model="gpt-5",
             tools=[{"type": "web_search"}],
-            tool_choice="auto",
+            input=f"{query}",
             max_output_tokens=300,
             temperature=0.3,
         )
 
-        # The Responses API returns a synthesized answer; we return a single item with text
+        # Return a single summarized item; callers expect a list
         text = getattr(resp, "output_text", "") or ""
         return [{"title": "web search summary", "url": "", "snippet": text}]
 
