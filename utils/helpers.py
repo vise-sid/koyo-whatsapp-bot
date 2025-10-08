@@ -71,7 +71,14 @@ def validate_twilio_http(request, body: bytes, auth_token: str, validate_signatu
 async def fetch_with_twilio_auth(url: str, account_sid: str, auth_token: str) -> bytes:
     """Fetch content from URL with Twilio authentication"""
     async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, auth=(account_sid, auth_token))
+        # Twilio media endpoints often respond with a 307 redirect to a CDN URL.
+        # Ensure we follow redirects to retrieve the actual media bytes.
+        r = await client.get(
+            url,
+            auth=(account_sid, auth_token),
+            follow_redirects=True,
+            headers={"Accept": "*/*"},
+        )
         r.raise_for_status()
         return r.content
 
