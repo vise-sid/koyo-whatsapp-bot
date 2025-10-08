@@ -180,7 +180,36 @@ class VoiceSessionManager:
         caller_phone = caller_number.replace("whatsapp:", "") if caller_number else "Unknown"
         caller_display_name = caller_name or "Unknown"
         
-        system_prompt = get_voice_system_prompt(caller_display_name, caller_phone, time_context)
+        # Fetch last 25 messages between user and character from Firebase for pre-call context
+        recent_context_text = ""
+        try:
+            if firebase_service.db and caller_phone and caller_phone != "Unknown":
+                convo_ref = (
+                    firebase_service.db.collection("users")
+                    .document(caller_phone)
+                    .collection("conversations")
+                    .document("meher")
+                    .collection("messages")
+                )
+                # Single-field order_by on 'timestamp' is supported without composite index
+                docs = (
+                    convo_ref.order_by("timestamp").limit_to_last(25).get()
+                )
+                history_lines = []
+                for d in docs:
+                    m = d.to_dict() or {}
+                    sender = m.get("sender")
+                    content = (m.get("content") or "").strip()
+                    if not content:
+                        continue
+                    label = "User" if sender == "user" else ("Meher" if sender == "character" else str(sender))
+                    history_lines.append(f"{label}: {content}")
+                if history_lines:
+                    recent_context_text = "\n\nRecent Conversation (last 25 messages):\n" + "\n".join(history_lines)
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch recent Firebase messages for {caller_phone}: {e}")
+
+        system_prompt = get_voice_system_prompt(caller_display_name, caller_phone, time_context) + recent_context_text
 
         ctx = OpenAILLMContext(
             messages=[{"role":"system","content":system_prompt}],
