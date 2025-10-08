@@ -104,15 +104,20 @@ async def elevenlabs_init_webhook(request: Request) -> JSONResponse:
                 "timestamp": datetime.utcnow().isoformat()
             }
         
-        # Get user's recent conversation context for personalization
+        # Get user's recent conversation context for personalization (messages, counts)
         user_context = await _get_user_context_for_call(caller_id)
-        
+
+        # Prefer caller details captured by Twilio voice webhook (voice_handler)
+        stored_info = caller_info_storage.get(call_sid or "", {})
+        resolved_user_name = stored_info.get("caller_name") or "User"
+        resolved_user_phone = stored_info.get("caller_number") or caller_id
+
         # Return conversation initiation data
         response_data = {
             "type": "conversation_initiation_client_data",
             "dynamic_variables": {
-                "user_phone": caller_id,
-                "user_name": user_context.get("name", "User"),
+                "user_phone": resolved_user_phone,
+                "user_name": resolved_user_name,
                 "last_interaction": user_context.get("last_interaction", ""),
                 "conversation_count": user_context.get("conversation_count", 0)
             }
