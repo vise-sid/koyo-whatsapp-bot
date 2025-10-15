@@ -195,7 +195,7 @@ async def save_message_to_firebase(
 
     try:
         if timestamp is None:
-            timestamp = datetime.now()
+            timestamp = get_mumbai_datetime()
 
         # Use the provided character name (defaults to "meher")
 
@@ -531,6 +531,24 @@ def extract_phone_number(whatsapp_number: str) -> str:
     return whatsapp_number or "Unknown"
 
 
+def get_mumbai_datetime() -> datetime:
+    """Get current datetime in Mumbai timezone"""
+    mumbai_tz = pytz.timezone("Asia/Kolkata")
+    return datetime.now(mumbai_tz)
+
+
+def normalize_datetime_to_mumbai(dt: datetime) -> datetime:
+    """Normalize a datetime to Mumbai timezone for consistent comparison"""
+    mumbai_tz = pytz.timezone("Asia/Kolkata")
+    if dt.tzinfo is None:
+        # If datetime is naive, make it timezone-aware
+        return mumbai_tz.localize(dt)
+    elif dt.tzinfo != mumbai_tz:
+        # Convert to Mumbai timezone if it's in a different timezone
+        return dt.astimezone(mumbai_tz)
+    return dt
+
+
 class WebSearchService:
     """Service for web search using Gemini 2.5 Flash"""
 
@@ -619,7 +637,7 @@ async def update_notification_tracking(
 
     try:
         if last_message_timestamp is None:
-            last_message_timestamp = datetime.now()
+            last_message_timestamp = get_mumbai_datetime()
 
         # Update the notifications collection with the structure shown in the image
         notification_data = {
@@ -770,7 +788,8 @@ async def check_and_send_reengagement_messages():
         return
 
     try:
-        current_time = datetime.now()
+        # Use timezone-aware datetime for consistent comparison
+        current_time = get_mumbai_datetime()
         two_minutes_ago = current_time - timedelta(minutes=2)
 
         # Query notifications collection for users who haven't received notifications
@@ -785,6 +804,9 @@ async def check_and_send_reengagement_messages():
             last_message_time = data.get("last_message_timestamp")
 
             if last_message_time and isinstance(last_message_time, datetime):
+                # Normalize datetime to Mumbai timezone for consistent comparison
+                last_message_time = normalize_datetime_to_mumbai(last_message_time)
+
                 # Check if 2 minutes have passed since last message
                 if last_message_time <= two_minutes_ago:
                     users_to_notify.append(
@@ -831,7 +853,7 @@ async def check_and_send_reengagement_messages():
                 )
 
                 if result["success"]:
-                    # Update notification tracking
+                    # Update notification tracking with timezone-aware datetime
                     doc_ref = db.collection("notifications").document(doc_id)
                     doc_ref.update(
                         {
@@ -881,7 +903,49 @@ async def reengagement_scheduler():
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "timestamp": datetime.now().isoformat(),
+        "firebase_connected": db is not None,
+        "scheduler_running": scheduler.running if scheduler else False,
+        "environment": {
+            "twilio_account_sid": bool(TWILIO_ACCOUNT_SID),
+            "twilio_auth_token": bool(TWILIO_AUTH_TOKEN),
+            "twilio_whatsapp_from": bool(TWILIO_WHATSAPP_FROM),
+            "openai_api_key": bool(OPENAI_API_KEY),
+            "gemini_api_key": bool(GEMINI_API_KEY),
+            "elevenlabs_api_key": bool(ELEVENLABS_API_KEY),
+            "deepgram_api_key": bool(DEEPGRAM_API_KEY),
+        },
+    }
+
+
+@app.post("/test-whatsapp")
+async def test_whatsapp(request: Request):
+    """Test endpoint to verify WhatsApp message sending"""
+    try:
+        data = await request.json()
+        to_number = data.get("to_number")
+        message = data.get("message", "Test message from Koyo bot")
+
+        if not to_number:
+            return {"error": "to_number is required"}
+
+        whatsapp_service = WhatsAppMessagingService(
+            account_sid=TWILIO_ACCOUNT_SID,
+            auth_token=TWILIO_AUTH_TOKEN,
+            from_number=TWILIO_WHATSAPP_FROM,
+        )
+
+        result = await whatsapp_service.send_message(
+            to_number=to_number, message=message, recipient_name="Test User"
+        )
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Test WhatsApp error: {e}")
+        return {"error": str(e)}
 
 
 @app.on_event("startup")
@@ -991,6 +1055,9 @@ async def whatsapp_webhook(request: Request):
         text_body = form.get("Body", "") or ""
         num_media = int(form.get("NumMedia", "0") or "0")
 
+        # Log all form data for debugging
+        logger.info(f"WhatsApp webhook form data: {dict(form)}")
+
         media_items = []
         for i in range(num_media):
             url = form.get(f"MediaUrl{i}")
@@ -1078,10 +1145,16 @@ async def whatsapp_webhook(request: Request):
         )
 
         try:
-            await whatsapp_service.send_freeform_message(
-                to_number=from_num, message=reply_text
+            # Use template-based message instead of freeform for better reliability
+            result = await whatsapp_service.send_message(
+                to_number=from_num, message=reply_text, recipient_name="User"
             )
-            logger.info(f"Successfully sent WhatsApp reply to {from_num}")
+            if result["success"]:
+                logger.info(f"Successfully sent WhatsApp reply to {from_num}")
+            else:
+                logger.error(
+                    f"Failed to send WhatsApp message to {from_num}: {result.get('error', 'Unknown error')}"
+                )
         except Exception as e:
             logger.error(f"Failed to send WhatsApp message to {from_num}: {e}")
             # Don't fail the webhook, just log the error
