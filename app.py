@@ -343,6 +343,23 @@ class WhatsAppMessagingService:
         self.client = Client(account_sid, auth_token)
         self.from_number = from_number
         self.logger = logging.getLogger(__name__)
+        self.account_sid = account_sid
+        self.auth_token = auth_token
+
+    async def validate_credentials(self) -> Dict[str, Any]:
+        """Validate Twilio credentials"""
+        try:
+            # Try to fetch account info to validate credentials
+            account = self.client.api.accounts(self.account_sid).fetch()
+            return {
+                "valid": True,
+                "account_sid": account.sid,
+                "account_name": account.friendly_name,
+                "status": account.status,
+            }
+        except Exception as e:
+            self.logger.error(f"Twilio credentials validation failed: {e}")
+            return {"valid": False, "error": str(e)}
 
     async def send_message(
         self, to_number: str, message: str, recipient_name: str = "User"
@@ -368,27 +385,61 @@ class WhatsAppMessagingService:
             if not from_number.startswith("whatsapp:"):
                 from_number = f"whatsapp:{from_number}"
 
-            # Use the approved koyo_simple template with content_sid
-            message_obj = self.client.messages.create(
-                from_=from_number,
-                to=to_number,
-                content_sid="HXe35b0e8a3ebf215e7407f5131ea03510",  # koyo_simple template SID
-                content_variables=json.dumps({"1": recipient_name, "2": message}),
-            )
+            # Try template-based message first
+            try:
+                message_obj = self.client.messages.create(
+                    from_=from_number,
+                    to=to_number,
+                    content_sid="HXe35b0e8a3ebf215e7407f5131ea03510",  # koyo_simple template SID
+                    content_variables=json.dumps({"1": recipient_name, "2": message}),
+                )
 
-            self.logger.info(
-                f"WhatsApp template message sent - SID: {message_obj.sid}, To: {to_number}"
-            )
+                self.logger.info(
+                    f"WhatsApp template message sent - SID: {message_obj.sid}, To: {to_number}"
+                )
 
-            return {
-                "success": True,
-                "message_sid": message_obj.sid,
-                "status": message_obj.status,
-                "to": to_number,
-                "message": message,
-                "template_used": True,
-                "template_name": "koyo_simple",
-            }
+                return {
+                    "success": True,
+                    "message_sid": message_obj.sid,
+                    "status": message_obj.status,
+                    "to": to_number,
+                    "message": message,
+                    "template_used": True,
+                    "template_name": "koyo_simple",
+                }
+
+            except Exception as template_error:
+                self.logger.warning(
+                    f"Template message failed, trying freeform: {template_error}"
+                )
+
+                # Fallback to freeform message
+                try:
+                    message_obj = self.client.messages.create(
+                        from_=from_number,
+                        to=to_number,
+                        body=message,
+                    )
+
+                    self.logger.info(
+                        f"WhatsApp freeform message sent - SID: {message_obj.sid}, To: {to_number}"
+                    )
+
+                    return {
+                        "success": True,
+                        "message_sid": message_obj.sid,
+                        "status": message_obj.status,
+                        "to": to_number,
+                        "message": message,
+                        "template_used": False,
+                        "template_name": "freeform",
+                    }
+
+                except Exception as freeform_error:
+                    self.logger.error(
+                        f"Both template and freeform failed for {to_number}: Template: {template_error}, Freeform: {freeform_error}"
+                    )
+                    raise freeform_error
 
         except Exception as e:
             self.logger.error(
@@ -847,12 +898,26 @@ async def check_and_send_reengagement_messages():
                 message = await generate_reengagement_message(user_id, character_name)
                 logger.info(f"Generated re-engagement message: {message[:100]}...")
 
-                # Send WhatsApp message
-                result = await whatsapp_service.send_message(
-                    to_number=user_id, message=message, recipient_name="User"
-                )
+                # Send WhatsApp message with retry logic
+                max_retries = 2
+                result = None
 
-                if result["success"]:
+                for attempt in range(max_retries):
+                    try:
+                        result = await whatsapp_service.send_message(
+                            to_number=user_id, message=message, recipient_name="User"
+                        )
+                        break  # Success, exit retry loop
+                    except Exception as send_error:
+                        logger.warning(
+                            f"Attempt {attempt + 1} failed for user {user_id}: {send_error}"
+                        )
+                        if attempt == max_retries - 1:
+                            result = {"success": False, "error": str(send_error)}
+                        else:
+                            await asyncio.sleep(1)  # Wait 1 second before retry
+
+                if result and result["success"]:
                     # Update notification tracking with timezone-aware datetime
                     doc_ref = db.collection("notifications").document(doc_id)
                     doc_ref.update(
@@ -865,11 +930,26 @@ async def check_and_send_reengagement_messages():
                     )
 
                     logger.info(
-                        f"✅ Successfully sent re-engagement message to user {user_id}"
+                        f"✅ Successfully sent re-engagement message to user {user_id} using {result.get('template_name', 'unknown')}"
                     )
                 else:
+                    error_msg = (
+                        result.get("error", "Unknown error")
+                        if result
+                        else "No result returned"
+                    )
                     logger.error(
-                        f"❌ Failed to send re-engagement message to user {user_id}: {result}"
+                        f"❌ Failed to send re-engagement message to user {user_id} after {max_retries} attempts: {error_msg}"
+                    )
+
+                    # Mark as failed but don't retry immediately
+                    doc_ref = db.collection("notifications").document(doc_id)
+                    doc_ref.update(
+                        {
+                            "last_failed_attempt": current_time,
+                            "failed_attempts": firestore.Increment(1),
+                            "updated_at": current_time,
+                        }
                     )
 
             except Exception as e:
@@ -945,6 +1025,36 @@ async def test_whatsapp(request: Request):
 
     except Exception as e:
         logger.error(f"Test WhatsApp error: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/validate-twilio")
+async def validate_twilio():
+    """Validate Twilio credentials and configuration"""
+    try:
+        whatsapp_service = WhatsAppMessagingService(
+            account_sid=TWILIO_ACCOUNT_SID,
+            auth_token=TWILIO_AUTH_TOKEN,
+            from_number=TWILIO_WHATSAPP_FROM,
+        )
+
+        validation_result = await whatsapp_service.validate_credentials()
+
+        return {
+            "twilio_validation": validation_result,
+            "configuration": {
+                "account_sid": TWILIO_ACCOUNT_SID[:8] + "..."
+                if TWILIO_ACCOUNT_SID
+                else None,
+                "auth_token": "***" + TWILIO_AUTH_TOKEN[-4:]
+                if TWILIO_AUTH_TOKEN
+                else None,
+                "whatsapp_from": TWILIO_WHATSAPP_FROM,
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"Twilio validation error: {e}")
         return {"error": str(e)}
 
 
