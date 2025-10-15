@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 import pytz
 import httpx
 import google.generativeai as genai
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 # Firebase imports
 import firebase_admin
@@ -54,6 +56,9 @@ offcall_context: Dict[str, list] = {}
 
 # Firebase client
 db = None
+
+# APScheduler for background tasks
+scheduler = AsyncIOScheduler()
 
 
 async def create_or_update_conversation_metadata(
@@ -247,13 +252,16 @@ async def save_message_to_firebase(
                     "last_user_message": content[:500],  # Store last user message
                     "sent_notification": False,  # Reset notification flag
                     "updated_at": timestamp,
+                    "message_count": firestore.Increment(1),  # Track total messages
                 }
 
                 doc_ref = db.collection("notifications").document(
                     f"{user_id}_{character_name}"
                 )
                 doc_ref.set(notification_data, merge=True)
-                logger.info(f"Updated notification tracking for user {user_id}")
+                logger.info(
+                    f"Updated notification tracking for user {user_id} with character {character_name}"
+                )
 
             except Exception as e:
                 logger.warning(f"Failed to update notification tracking: {e}")
@@ -755,7 +763,7 @@ async def generate_reengagement_message(
 
 async def check_and_send_reengagement_messages():
     """
-    Background task to check for users who need re-engagement messages after 8 hours
+    Background task to check for users who need re-engagement messages after 2 minutes
     """
     if db is None:
         logger.warning("Firebase not available for re-engagement check")
@@ -763,7 +771,7 @@ async def check_and_send_reengagement_messages():
 
     try:
         current_time = datetime.now()
-        eight_hours_ago = current_time - timedelta(hours=8)
+        two_minutes_ago = current_time - timedelta(minutes=2)
 
         # Query notifications collection for users who haven't received notifications
         notifications_ref = db.collection("notifications")
@@ -777,8 +785,8 @@ async def check_and_send_reengagement_messages():
             last_message_time = data.get("last_message_timestamp")
 
             if last_message_time and isinstance(last_message_time, datetime):
-                # Check if 8 hours have passed since last message
-                if last_message_time <= eight_hours_ago:
+                # Check if 2 minutes have passed since last message
+                if last_message_time <= two_minutes_ago:
                     users_to_notify.append(
                         {
                             "user_id": data.get("user_id"),
@@ -803,10 +811,19 @@ async def check_and_send_reengagement_messages():
             try:
                 user_id = user_info["user_id"]
                 doc_id = user_info["doc_id"]
+                character_name = user_info.get("character_name", "meher")
+                last_message_time = user_info.get("last_message_time")
+
+                logger.info(
+                    f"Processing re-engagement for user {user_id} (character: {character_name})"
+                )
+                logger.info(
+                    f"Last message time: {last_message_time}, Current time: {current_time}"
+                )
 
                 # Generate personalized re-engagement message
-                character_name = user_info.get("character_name", "meher")
                 message = await generate_reengagement_message(user_id, character_name)
+                logger.info(f"Generated re-engagement message: {message[:100]}...")
 
                 # Send WhatsApp message
                 result = await whatsapp_service.send_message(
@@ -821,18 +838,21 @@ async def check_and_send_reengagement_messages():
                             "sent_notification": True,
                             "notification_sent_at": current_time,
                             "updated_at": current_time,
+                            "last_reengagement_message": message[:500],
                         }
                     )
 
-                    logger.info(f"Sent re-engagement message to user {user_id}")
+                    logger.info(
+                        f"✅ Successfully sent re-engagement message to user {user_id}"
+                    )
                 else:
                     logger.error(
-                        f"Failed to send re-engagement message to user {user_id}: {result}"
+                        f"❌ Failed to send re-engagement message to user {user_id}: {result}"
                     )
 
             except Exception as e:
                 logger.error(
-                    f"Error sending re-engagement message to user {user_info['user_id']}: {e}"
+                    f"❌ Error sending re-engagement message to user {user_info.get('user_id', 'unknown')}: {e}"
                 )
 
     except Exception as e:
@@ -840,15 +860,23 @@ async def check_and_send_reengagement_messages():
 
 
 async def reengagement_scheduler():
-    """Background scheduler for re-engagement messages"""
-    while True:
-        try:
-            await check_and_send_reengagement_messages()
-            # Check every hour
-            await asyncio.sleep(3600)
-        except Exception as e:
-            logger.error(f"Error in re-engagement scheduler: {e}")
-            await asyncio.sleep(3600)  # Wait an hour before retrying
+    """Background scheduler for re-engagement messages using APScheduler"""
+    try:
+        # Add job to scheduler - run every 30 seconds to check for users
+        scheduler.add_job(
+            check_and_send_reengagement_messages,
+            trigger=IntervalTrigger(seconds=30),
+            id="reengagement_check",
+            name="Check for users needing re-engagement messages",
+            replace_existing=True,
+        )
+
+        # Start the scheduler
+        scheduler.start()
+        logger.info("APScheduler started for re-engagement messages")
+
+    except Exception as e:
+        logger.error(f"Error starting APScheduler: {e}")
 
 
 @app.get("/health")
@@ -890,19 +918,25 @@ async def startup_event():
         logger.info("Firebase initialized and tested successfully")
 
         # Start re-engagement scheduler
-        reengagement_task = asyncio.create_task(reengagement_scheduler())
-        reengagement_task.add_done_callback(
-            lambda t: logger.error(f"Re-engagement scheduler failed: {t.exception()}")
-            if t.exception()
-            else None
-        )
-        logger.info("Started re-engagement scheduler")
+        await reengagement_scheduler()
+        logger.info("Started APScheduler for re-engagement messages")
 
     except Exception as e:
         logger.error(f"Firebase initialization failed: {e}")
         db = None
         # Don't crash the app, but log the critical error
         logger.critical("Firebase is not available - message saving will fail")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up resources when the app shuts down"""
+    try:
+        if scheduler.running:
+            scheduler.shutdown()
+            logger.info("APScheduler stopped")
+    except Exception as e:
+        logger.error(f"Error stopping scheduler: {e}")
 
 
 # ---- helpers ----
@@ -1029,34 +1063,49 @@ async def whatsapp_webhook(request: Request):
             return Response(status_code=204)
 
         # No live session -> off-call LLM chat with context and reply over WhatsApp (freeform)
-        reply_text = await handle_multimodal_offcall(
-            text_body, media_items, from_num, "meher"
-        )
+        try:
+            reply_text = await handle_multimodal_offcall(
+                text_body, media_items, from_num, "meher"
+            )
+        except Exception as e:
+            logger.error(f"Error in multimodal offcall handler: {e}")
+            reply_text = "Sorry, I'm having some technical difficulties. Please try again in a moment."
 
         whatsapp_service = WhatsAppMessagingService(
             account_sid=TWILIO_ACCOUNT_SID,
             auth_token=TWILIO_AUTH_TOKEN,
             from_number=TWILIO_WHATSAPP_FROM,
         )
-        await whatsapp_service.send_freeform_message(
-            to_number=from_num, message=reply_text
-        )
+
+        try:
+            await whatsapp_service.send_freeform_message(
+                to_number=from_num, message=reply_text
+            )
+            logger.info(f"Successfully sent WhatsApp reply to {from_num}")
+        except Exception as e:
+            logger.error(f"Failed to send WhatsApp message to {from_num}: {e}")
+            # Don't fail the webhook, just log the error
 
         # Save both user message and character response to Firebase
-        await save_message_to_firebase(
-            user_id=from_num,
-            sender="user",
-            content=text_body,
-            conversation_type="text",
-            character_name="meher",
-        )
-        await save_message_to_firebase(
-            user_id=from_num,
-            sender="character",
-            content=reply_text,
-            conversation_type="text",
-            character_name="meher",
-        )
+        try:
+            await save_message_to_firebase(
+                user_id=from_num,
+                sender="user",
+                content=text_body,
+                conversation_type="text",
+                character_name="meher",
+            )
+            await save_message_to_firebase(
+                user_id=from_num,
+                sender="character",
+                content=reply_text,
+                conversation_type="text",
+                character_name="meher",
+            )
+            logger.info(f"Successfully saved messages to Firebase for {from_num}")
+        except Exception as e:
+            logger.error(f"Failed to save messages to Firebase for {from_num}: {e}")
+            # Don't fail the webhook, just log the error
 
         # Return 204 to avoid Twilio echoing body as a user-visible message
         return Response(status_code=204)
